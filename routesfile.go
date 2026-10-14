@@ -1,0 +1,330 @@
+package main
+
+// routes.toml 声明式路由 + 热加载（TDD 第二批 · 步骤6，F1-F8，
+// IMPLEMENTATION-PLAN.md §2.3）。
+//
+// 定位：operator 面向的静态路由声明文件，与 config.go 的 staticRoutes()
+// 合并，同前缀本文件优先。保存后 5s 内热加载；kill -HUP 立即重载；
+// 语法错误整版拒绝并保留上一版。
+//
+// 解析器是**严格 TOML 子集**（刻意收窄，不做通用 TOML）：
+//   - 仅 # 注释、[[route]] 数组表、key = value；
+//   - 值为双引号字符串（\" \\ \n 转义）或裸整数；
+//   - 子集外一律返回带行号的致命错误。
+// 分界：值格式错误（引号/转义/数字/duration）= 致命，整版拒绝；
+// 条目语义问题（缺字段/越界/mode 非法/重复 prefix）= 条目级跳过，
+// 进 Warnings，其余条目保留。
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+)
+
+// parseResult 解析产物：Routes 为成功条目，Warnings 为被跳过条目的
+// 带行号原因（不阻断加载）。
+type parseResult struct {
+	Routes   []*Route
+	Warnings []string
+}
+
+// parseRoutesFile 读盘并解析。error 仅表示文件 IO 失败；
+// 语法致命错误由 parseRoutes 返回（watcher 据此保留上一版）。
+func parseRoutesFile(path string) (*parseResult, error) {
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parseRoutes(blob)
+}
+
+// parseRoutes 解析 routes.toml 严格子集。
+func parseRoutes(blob []byte) (*parseResult, error) {
+	res := &parseResult{}
+	var (
+		cur     *Route
+		curLine int
+		seen    = map[string]bool{}
+	)
+	flush := func() {
+		if cur == nil {
+			return
+		}
+		if err := validateFileRoute(cur, curLine); err != nil {
+			res.Warnings = append(res.Warnings, err.Error())
+			cur = nil
+			return
+		}
+		if seen[cur.Prefix] {
+			res.Warnings = append(res.Warnings,
+				fmt.Sprintf("第 %d 行：prefix %q 重复，后者已跳过", curLine, cur.Prefix))
+			cur = nil
+			return
+		}
+		seen[cur.Prefix] = true
+		res.Routes = append(res.Routes, cur)
+		cur = nil
+	}
+
+	for i, raw := range strings.Split(string(blob), "\n") {
+		lineNo := i + 1
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "[[") {
+			if line != "[[route]]" {
+				return nil, fmt.Errorf("第 %d 行：仅支持 [[route]] 数组表，得到 %q", lineNo, line)
+			}
+			flush()
+			cur = &Route{Mode: ModeStrip}
+			curLine = lineNo
+			continue
+		}
+		if strings.HasPrefix(line, "[") {
+			return nil, fmt.Errorf("第 %d 行：不支持 [table] 语法（仅接受 [[route]]）：%q", lineNo, line)
+		}
+		eq := strings.Index(line, "=")
+		if eq < 0 {
+			return nil, fmt.Errorf("第 %d 行：缺少 '='：%q", lineNo, strings.TrimSpace(raw))
+		}
+		if cur == nil {
+			return nil, fmt.Errorf("第 %d 行：key = value 出现在 [[route]] 之外", lineNo)
+		}
+		key := strings.TrimSpace(line[:eq])
+		val := strings.TrimSpace(line[eq+1:])
+		if err := applyRouteField(cur, key, val, lineNo); err != nil {
+			return nil, err
+		}
+	}
+	flush()
+	return res, nil
+}
+
+// applyRouteField 把单个 key = value 写进当前 Route。
+func applyRouteField(rt *Route, key, val string, lineNo int) error {
+	switch key {
+	case "prefix", "host", "display", "desc", "icon", "mode":
+		s, err := parseTomlString(val, lineNo, key)
+		if err != nil {
+			return err
+		}
+		switch key {
+		case "prefix":
+			rt.Prefix = s
+		case "host":
+			rt.Host = s
+		case "display":
+			rt.Display = s
+		case "desc":
+			rt.Desc = s
+		case "icon":
+			rt.Icon = s
+		case "mode":
+			rt.Mode = parseModeName(s) // 非法值留待 validateFileRoute 条目级拒绝
+		}
+	case "hidden":
+		// 布尔裸字面量（true/false）；其他值按条目级 warning 跳过，
+		// 避免拼错（如 "yes"）静默改变行为
+		switch val {
+		case "true":
+			rt.Hidden = true
+		case "false":
+			rt.Hidden = false
+		default:
+			return fmt.Errorf("第 %d 行：hidden 必须是 true/false，得到 %q", lineNo, val)
+		}
+	case "port":
+		n, err := strconv.Atoi(val)
+		if err != nil {
+			return fmt.Errorf("第 %d 行：port 必须是整数，得到 %q", lineNo, val)
+		}
+		rt.Port = n
+	case "response_header_timeout":
+		s, err := parseTomlString(val, lineNo, key)
+		if err != nil {
+			return err
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("第 %d 行：response_header_timeout 不是合法 duration：%q", lineNo, s)
+		}
+		rt.ResponseHeaderTimeout = Duration(d)
+	default:
+		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout）", lineNo, key)
+	}
+	return nil
+}
+
+// parseModeName 把 "strip"/"keep" 映射为 Mode；非法值返回 Mode(-1)
+// （既非 ModeStrip 也非 ModeKeep，validateFileRoute 会条目级拒绝）。
+func parseModeName(s string) Mode {
+	switch s {
+	case "strip":
+		return ModeStrip
+	case "keep":
+		return ModeKeep
+	default:
+		return Mode(-1)
+	}
+}
+
+// validateFileRoute 条目级校验。返回的错误即 warning 文本（含行号）。
+func validateFileRoute(rt *Route, lineNo int) error {
+	if _, ok := normalizePrefix(rt.Prefix); !ok {
+		return fmt.Errorf("第 %d 行：prefix 缺失或非法（须以 / 开头和结尾、不能为 /、无空段）", lineNo)
+	}
+	if rt.Host == "" {
+		return fmt.Errorf("第 %d 行：host 缺失", lineNo)
+	}
+	if rt.Port <= 0 || rt.Port > 65535 {
+		return fmt.Errorf("第 %d 行：port 越界（1-65535），得到 %d", lineNo, rt.Port)
+	}
+	if rt.Mode != ModeStrip && rt.Mode != ModeKeep {
+		return fmt.Errorf("第 %d 行：mode 须为 \"strip\" 或 \"keep\"", lineNo)
+	}
+	if rt.ResponseHeaderTimeout < 0 || rt.ResponseHeaderTimeout > Duration(maxRouteTimeout) {
+		return fmt.Errorf("第 %d 行：response_header_timeout 越界（0-5m）", lineNo)
+	}
+	return nil
+}
+
+// parseTomlString 解析双引号字符串值（支持 \" \\ \n 转义）。
+func parseTomlString(s string, lineNo int, key string) (string, error) {
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return "", fmt.Errorf("第 %d 行：%s 的值必须是双引号字符串，得到 %q", lineNo, key, s)
+	}
+	inner := s[1 : len(s)-1]
+	var b strings.Builder
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		if c != '\\' {
+			b.WriteByte(c)
+			continue
+		}
+		i++
+		if i >= len(inner) {
+			return "", fmt.Errorf("第 %d 行：%s 的值以孤立反斜杠结尾", lineNo, key)
+		}
+		switch inner[i] {
+		case '"':
+			b.WriteByte('"')
+		case '\\':
+			b.WriteByte('\\')
+		case 'n':
+			b.WriteByte('\n')
+		default:
+			return "", fmt.Errorf("第 %d 行：不支持的转义序列 \\%c", lineNo, inner[i])
+		}
+	}
+	return b.String(), nil
+}
+
+// ---------------------------------------------------------------------------
+// 合并与热加载
+// ---------------------------------------------------------------------------
+
+// MergeFileRoutes 把 routes.toml 的路由合并进静态层：同前缀 file 覆盖
+// code static（部署者意图：文件是显式声明，压过代码默认）。
+// 只增覆盖，不清空——清空/重建由 reload 流程的 SetStatic 负责（防漂移）。
+func (t *RouteTable) MergeFileRoutes(file []*Route) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, r := range file {
+		p, ok := normalizePrefix(r.Prefix)
+		if !ok {
+			log.Printf("[route] 忽略 file 路由的非法前缀 %q", r.Prefix)
+			continue
+		}
+		r.Prefix = p
+		r.Source = "static" // file 层是静态层的扩展，导航/快照语义一致
+		t.static[p] = r
+	}
+}
+
+// fileRoutes 管理 routes.toml 的加载与热加载。
+type fileRoutes struct {
+	path string
+}
+
+// reload 重读文件并生效。返回值语义（watcher/SIGHUP 共用）：
+//   - nil：已生效（含文件缺失→回退仅 code static、条目级跳过）；
+//   - 非 nil：语法致命错误，**表保持上一版不动**（响铃由调用方记）。
+func (fr *fileRoutes) reload() error {
+	res, err := parseRoutesFile(fr.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 文件被删：回退到仅 code static
+			table.SetStatic(staticRoutes())
+			log.Printf("[route] routes 文件不存在，回退仅代码静态路由：%s", fr.path)
+			return nil
+		}
+		return err // 损坏/语法错误：保留上一版
+	}
+	// 先按 code static 重建（抹掉上一版 file 路由，防漂移），再合并新版
+	table.SetStatic(staticRoutes())
+	table.MergeFileRoutes(res.Routes)
+	for _, w := range res.Warnings {
+		log.Printf("[route] routes 文件警告：%s", w)
+	}
+	log.Printf("[route] routes 文件已生效：%d 条", len(res.Routes))
+	return nil
+}
+
+// handleSignals 响应 SIGHUP：立即重载（与 watch 的 reload 是同一函数，
+// 信号只是手动触发通道）。stop 为 nil 时只服务信号（生产接线）；
+// 测试传入 stop channel 以回收 goroutine。
+//
+// signal.Notify **同步执行后立即返回**——注册在调用方 goroutine 完成，
+// 杜绝"信号已到达但 handler 未注册"的竞态（那会走 SIGHUP 默认行为
+// 直接终止进程）。处理循环放内部 goroutine，调用方无需 go 包装。
+func (fr *fileRoutes) handleSignals(stop <-chan struct{}) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGHUP)
+	go func() {
+		defer signal.Stop(ch)
+		for {
+			select {
+			case <-ch:
+				if err := fr.reload(); err != nil {
+					log.Printf("[route] SIGHUP 重载失败，保留上一版：%v", err)
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+// watch 轮询 mtime+size，变化即 reload。interval 必须 > 0。
+func (fr *fileRoutes) watch(interval time.Duration) {
+	if err := fr.reload(); err != nil {
+		log.Printf("[route] routes 文件首次加载失败（继续以代码静态路由运行）：%v", err)
+	}
+	var lastMod time.Time
+	var lastSize int64
+	if st, err := os.Stat(fr.path); err == nil {
+		lastMod, lastSize = st.ModTime(), st.Size()
+	}
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+	for range tick.C {
+		st, err := os.Stat(fr.path)
+		if err != nil {
+			continue
+		}
+		if st.ModTime().Equal(lastMod) && st.Size() == lastSize {
+			continue
+		}
+		lastMod, lastSize = st.ModTime(), st.Size()
+		if err := fr.reload(); err != nil {
+			log.Printf("[route] routes 文件重载失败，保留上一版：%v", err)
+			continue
+		}
+	}
+}
