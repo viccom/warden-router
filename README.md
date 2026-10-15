@@ -7,7 +7,12 @@
 
 ## 构建与测试
 
+需要 **Go ≥ 1.27**（go.mod 要求；系统自带 go1.21 会报 toolchain 不可用）。
+工具链装在 `/usr/local/go1.27`（容器层，沙箱重建后会丢；重装包持久化于
+`/workspace/warden/dist/go1.27.2.linux-amd64.tar.gz`）。构建时显式指定：
+
 ```sh
+export GOROOT=/usr/local/go1.27 PATH=/usr/local/go1.27/bin:$PATH
 go build -o build/warden-route-go .   # 产物输出到 build/（不进源码树）
 go test -race -count=5 ./...          # 全量测试（表驱动 + 真 TCP 集成）
 gofmt -l . && go vet ./...
