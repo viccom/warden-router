@@ -494,3 +494,67 @@ public_host = "ad8584f64ca039337.app.workbuddy.host"
 		})
 	}
 }
+
+// HF2 静态注入三件套解析（auth_bridge_token/gate/gate_key，2026-10-16）
+func TestParseRoutesFile_StaticGate(t *testing.T) {
+	toml := `[[route]]
+prefix = "/warden/"
+host = "127.0.0.1"
+port = 8789
+mode = "strip"
+auth_bridge_token = "6SkAB4gFmBk6xdtkIcXF1JbB3SlL"
+auth_bridge_gate = "/warden/.gate"
+auth_bridge_gate_key = "0123456789abcdef"
+`
+	res, err := parseRoutes([]byte(toml))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(res.Routes) != 1 || len(res.Warnings) != 0 {
+		t.Fatalf("Routes=%d Warnings=%v", len(res.Routes), res.Warnings)
+	}
+	ab := res.Routes[0].AuthBridge
+	if ab == nil {
+		t.Fatalf("AuthBridge 未隐式启用")
+	}
+	if ab.Token != "6SkAB4gFmBk6xdtkIcXF1JbB3SlL" || ab.GatePath != "/warden/.gate" || ab.GateKey != "0123456789abcdef" {
+		t.Errorf("静态字段错：%+v", ab)
+	}
+
+	bads := []struct{ name, toml, want string }{
+		{"token 未加引号", "[[route]]\nprefix = \"/warden/\"\nauth_bridge_token = 6SkAB\n", "第 3 行"},
+		{"gate 未加引号", "[[route]]\nprefix = \"/warden/\"\nauth_bridge_gate = /warden/.gate\n", "第 3 行"},
+		{"gate_key 未加引号", "[[route]]\nprefix = \"/warden/\"\nauth_bridge_gate_key = 0123456789abcdef\n", "第 3 行"},
+		{"gate 缺前导斜杠", "[[route]]\nprefix = \"/warden/\"\nauth_bridge_gate = \"warden/.gate\"\n", "auth_bridge_gate"},
+		{"gate_key 太短", "[[route]]\nprefix = \"/warden/\"\nauth_bridge_gate_key = \"short\"\n", "auth_bridge_gate_key"},
+		{"gate_key 非法字符", "[[route]]\nprefix = \"/warden/\"\nauth_bridge_gate_key = \"0123456789abcde!\"\n", "auth_bridge_gate_key"},
+		{"token 含 CR", "[[route]]\nprefix = \"/warden/\"\nauth_bridge_token = \"tok\rX-Evil: 1\"\n", "auth_bridge_token"},
+		{"token 含空格", "[[route]]\nprefix = \"/warden/\"\nauth_bridge_token = \"to k\"\n", "auth_bridge_token"},
+	}
+	for _, tc := range bads {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseRoutes([]byte(tc.toml))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("应报致命错误（含 %q），得到 %v", tc.want, err)
+			}
+		})
+	}
+
+	// 语义组合问题（三件套不完整 / gate 越界）→ 条目级 warning，不致命
+	semantics := []struct{ name, toml, want string }{
+		{"只有 token", "[[route]]\nprefix = \"/warden/\"\nhost = \"127.0.0.1\"\nport = 8789\nauth_bridge_token = \"tok\"\n", "auth_bridge_token"},
+		{"gate 不在前缀内", "[[route]]\nprefix = \"/warden/\"\nhost = \"127.0.0.1\"\nport = 8789\nauth_bridge_gate = \"/other/.gate\"\n", "auth_bridge_gate"},
+		{"gate 等于前缀", "[[route]]\nprefix = \"/warden/\"\nhost = \"127.0.0.1\"\nport = 8789\nauth_bridge_gate = \"/warden/\"\n", "auth_bridge_gate"},
+	}
+	for _, tc := range semantics {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := parseRoutes([]byte(tc.toml))
+			if err != nil {
+				t.Fatalf("语义问题不应致命：%v", err)
+			}
+			if len(res.Routes) != 0 || len(res.Warnings) != 1 || !strings.Contains(res.Warnings[0], tc.want) {
+				t.Errorf("期望 1 条含 %q 的 warning，得到 Routes=%d Warnings=%v", tc.want, len(res.Routes), res.Warnings)
+			}
+		})
+	}
+}

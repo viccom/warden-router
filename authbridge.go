@@ -21,7 +21,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -46,6 +51,21 @@ const authBridgeMaxAge = 24 * 60 * 60
 // 请求侧：从 cookie 恢复 Authorization 头
 // ---------------------------------------------------------------------------
 
+// authBridgeCookieName 解析路由实际使用的桥接 cookie 名。静态模式
+// （Token 非空）缺省用 authBridgeGateCookieDefault（"_wrauth-gate"），
+// 登录流缺省用 authBridgeCookieDefault（"_wrauth"）——两种模式的
+// cookie 值语义不同（HMAC 标记 vs token 本身），默认名必须区分，
+// 否则门控种的 cookie 请求侧认不出。
+func authBridgeCookieName(ab *AuthBridge) string {
+	if ab.CookieName != "" {
+		return ab.CookieName
+	}
+	if ab.Token != "" {
+		return authBridgeGateCookieDefault
+	}
+	return authBridgeCookieDefault
+}
+
 // restoreAuthHeader 在 Rewrite 内调用：用桥接 cookie 的值恢复
 // Authorization 头。
 //
@@ -55,16 +75,31 @@ const authBridgeMaxAge = 24 * 60 * 60
 // 前就被替换成了这个假 token，"有头就跳过"会把平台 JWT 当客户端原值
 // 放行，上游收到的必然 401。桥接 cookie 是本域 HttpOnly 的登录态，
 // 比任何透传头都可信，故覆盖。
+//
+// 两种模式（按 AuthBridge.Token 是否非空区分）：
+//   - 登录流（Token 为空）：cookie 值就是登录得到的 token，原样恢复
+//     （vnts2 / OpenList）。
+//   - 静态（Token 非空）：cookie 值是门控 HMAC 标记（不是 token），
+//     验过 HMAC 后用配置的静态 Token 覆盖（warden：无登录 API）。
 func restoreAuthHeader(pr *httputil.ProxyRequest, rt *Route) {
 	if rt == nil || rt.AuthBridge == nil {
 		return
 	}
-	name := rt.AuthBridge.CookieName
-	if name == "" {
-		name = authBridgeCookieDefault
-	}
+	name := authBridgeCookieName(rt.AuthBridge)
 	c, err := pr.In.Cookie(name)
 	if err != nil || c.Value == "" {
+		return
+	}
+	if rt.AuthBridge.Token != "" {
+		// 静态模式：cookie 值须等于门控 HMAC 标记，防伪造/猜测
+		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(gateCookieValue(rt.AuthBridge))) != 1 {
+			return
+		}
+		val := rt.AuthBridge.Token
+		if rt.AuthBridge.Scheme != "" {
+			val = rt.AuthBridge.Scheme + " " + val
+		}
+		pr.Out.Header.Set("Authorization", val)
 		return
 	}
 	val := c.Value
@@ -75,6 +110,73 @@ func restoreAuthHeader(pr *httputil.ProxyRequest, rt *Route) {
 }
 
 // ---------------------------------------------------------------------------
+// 静态模式：门控路径换 cookie（warden 类无登录 API 的上游）
+// ---------------------------------------------------------------------------
+
+// authBridgeGateCookieDefault 静态模式默认门控 cookie 名。与登录流的
+// "_wrauth" 区分：两种模式的 cookie 值语义不同（HMAC 标记 vs token
+// 本身），同名会造成语义混淆；且发布网关会把 Path 改写成 "/"（实测），
+// 多路由必须不同名。
+const authBridgeGateCookieDefault = "_wrauth-gate"
+
+// gateCookieValue 计算门控 cookie 的期望值：HMAC-SHA256(GateKey,
+// "warden-route:static-gate:"+cookieName) 的 hex 前 32 字符。
+// 无状态（无需服务端会话存储）、可验证（防伪造 cookie）、随 GateKey
+// 轮换而失效。绑定 cookie 名：同 GateKey 的不同路由得不同值，
+// 杜绝跨路由 cookie  tossing。
+func gateCookieValue(ab *AuthBridge) string {
+	name := authBridgeCookieName(ab)
+	mac := hmac.New(sha256.New, []byte(ab.GateKey))
+	_, _ = mac.Write([]byte("warden-route:static-gate:" + name))
+	return hex.EncodeToString(mac.Sum(nil))[:32]
+}
+
+// handleAuthGate 处理静态模式门控路径。返回 true 表示已处理完毕
+// （调用方不应再转发）。仅当路由配了静态三件套且请求路径恰好等于
+// GatePath 时介入；其余请求原样放行转发。
+//
+// 安全模型：GateKey 是唯一凭据（常量时间比对）——拿到分享链接的
+// 攻击者没有 Key 时：门控 403、业务路径无 cookie 不注入，上游
+// 收到平台 JWT 判 401，零控制权。
+func handleAuthGate(w http.ResponseWriter, r *http.Request, rt *Route) bool {
+	if rt == nil || rt.AuthBridge == nil || rt.AuthBridge.Token == "" {
+		return false
+	}
+	if r.URL.Path != rt.AuthBridge.GatePath {
+		return false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return true
+	}
+	got := r.URL.Query().Get("k")
+	if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(rt.AuthBridge.GateKey)) != 1 {
+		http.Error(w, "forbidden: invalid gate key", http.StatusForbidden)
+		return true
+	}
+	name := authBridgeCookieName(rt.AuthBridge)
+	http.SetCookie(w, &http.Cookie{
+		Name:     name,
+		Value:    gateCookieValue(rt.AuthBridge),
+		Path:     rt.Prefix,
+		MaxAge:   authBridgeMaxAge,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	// 302 回前缀，保留 sharecode 等其余查询参数（发布链接的访问凭据
+	// 可能挂在查询串上，剥 k 即可）。
+	q := r.URL.Query()
+	q.Del("k")
+	loc := rt.Prefix
+	if enc := q.Encode(); enc != "" {
+		loc += "?" + enc
+	}
+	http.Redirect(w, r, loc, http.StatusFound)
+	return true
+}
+
+// ---------------------------------------------------------------------------
 // 响应侧：登录响应提取 token 种 cookie
 // ---------------------------------------------------------------------------
 
@@ -82,8 +184,15 @@ func restoreAuthHeader(pr *httputil.ProxyRequest, rt *Route) {
 // 重写之后，避免自身种的 cookie 被 rewriteSetCookie 二次加前缀）。
 // 只认「POST + 200 + JSON + body 含 token 字段」的响应——登录接口的形态；
 // 其余响应原样放回，零行为变化。
+//
+// 静态模式（Token 非空）直接跳过：warden 的 POST API 也可能返回含
+// token 字段的 JSON，不能被误当登录响应桥接；门控 cookie 由
+// handleAuthGate 专门发放。
 func bridgeLoginCookie(resp *http.Response, rt *Route) {
 	if rt == nil || rt.AuthBridge == nil || resp.Request == nil {
+		return
+	}
+	if rt.AuthBridge.Token != "" {
 		return
 	}
 	if resp.Request.Method != http.MethodPost || resp.StatusCode != http.StatusOK {
@@ -114,10 +223,7 @@ func bridgeLoginCookie(resp *http.Response, rt *Route) {
 		return // 非登录响应（业务 JSON 也常是 200），不种 cookie
 	}
 
-	name := rt.AuthBridge.CookieName
-	if name == "" {
-		name = authBridgeCookieDefault
-	}
+	name := authBridgeCookieName(rt.AuthBridge)
 	cookie := name + "=" + token +
 		"; Path=" + rt.Prefix +
 		"; Max-Age=" + itoa(authBridgeMaxAge) +
@@ -215,4 +321,83 @@ func validAuthBridgeCookieName(s string) bool {
 		}
 	}
 	return true
+}
+
+// 静态注入三件套的字段约束。
+const (
+	maxStaticTokenLen = 512 // token 进 HTTP 头，512 足够任何真实 token
+	minGateKeyLen     = 16  // 门控密钥是唯一凭据，短于 16 位可暴力
+	maxGateKeyLen     = 128
+	maxGatePathLen    = 256
+)
+
+// validStaticToken 校验静态 token：可见 ASCII（0x21-0x7e）、非空、
+// 不超长。禁空格（会破坏 "Bearer <token>" 头结构）与控制字符
+// （CRLF=头注入）。
+func validStaticToken(s string) bool {
+	if s == "" || len(s) > maxStaticTokenLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] <= ' ' || s[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// validGateKey 校验门控密钥：[A-Za-z0-9_-]，16-128 位。URL 安全字符集
+// 避免查询串编解码歧义（浏览器/Go 对 % 等字符的处理差异会让比对失败）；
+// 长度下限保证不可暴力。
+func validGateKey(s string) bool {
+	if len(s) < minGateKeyLen || len(s) > maxGateKeyLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// authBridgeStaticReason 返回静态三件套的问题描述（""=无问题）。
+// validAuthBridgeStatic 与 routesfile 的条目级 warning 共用，保证
+// 在线 API 与磁盘加载的判定逻辑单一权威。
+func authBridgeStaticReason(ab *AuthBridge, prefix string) string {
+	hasToken, hasGate, hasKey := ab.Token != "", ab.GatePath != "", ab.GateKey != ""
+	if !hasToken && !hasGate && !hasKey {
+		return ""
+	}
+	if !hasToken || !hasGate || !hasKey {
+		return "auth_bridge 静态三件套（auth_bridge_token/auth_bridge_gate/auth_bridge_gate_key）须成对配置"
+	}
+	if !validStaticToken(ab.Token) {
+		return "auth_bridge_token 含非法字符（空格/控制字符/非 ASCII）或为空/超长"
+	}
+	if !validGateKey(ab.GateKey) {
+		return "auth_bridge_gate_key 须为 16-128 位 URL 安全字符 [A-Za-z0-9_-]"
+	}
+	if !strings.HasPrefix(ab.GatePath, "/") || len(ab.GatePath) > maxGatePathLen {
+		return "auth_bridge_gate 须为以 / 开头的绝对路径且不超过 256 字符"
+	}
+	// gate 必须在前缀内（否则 Lookup 命中不了本路由，门控永不生效），
+	// 且不能等于前缀本身（那会遮蔽路由 UI）。
+	if !strings.HasPrefix(ab.GatePath, prefix) || ab.GatePath == prefix {
+		return fmt.Sprintf("auth_bridge_gate 须位于路由前缀内且不等于前缀（gate=%q，prefix=%q）", ab.GatePath, prefix)
+	}
+	return ""
+}
+
+// validAuthBridgeStatic 校验静态三件套的整体语义（字段级 charset 由
+// validStaticToken/validGateKey 在解析层兜底）：
+//   - 全不配 → true（登录流或未启用）
+//   - 全配且 gate 落在前缀内、gate != 前缀 → true
+//   - 任一为缺 → false（缺一三件套即拒绝，杜绝无条件注入）
+func validAuthBridgeStatic(ab *AuthBridge, prefix string) bool {
+	return authBridgeStaticReason(ab, prefix) == ""
 }

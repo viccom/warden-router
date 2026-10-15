@@ -195,6 +195,48 @@ func applyRouteField(rt *Route, key, val string, lineNo int) error {
 			rt.AuthBridge = &AuthBridge{}
 		}
 		rt.AuthBridge.CookieName = s
+	case "auth_bridge_token":
+		// 静态注入的 token（warden 类无登录 API 的上游）。与
+		// auth_bridge_gate/gate_key 成三件套，缺一由 validateFileRoute
+		// 条目级拒绝。隐式启用桥接。
+		s, err := parseTomlString(val, lineNo, key)
+		if err != nil {
+			return err
+		}
+		if !validStaticToken(s) {
+			return fmt.Errorf("第 %d 行：auth_bridge_token 含非法字符（空格/控制字符/非 ASCII）或为空/超长：%q", lineNo, s)
+		}
+		if rt.AuthBridge == nil {
+			rt.AuthBridge = &AuthBridge{}
+		}
+		rt.AuthBridge.Token = s
+	case "auth_bridge_gate":
+		// 门控路径（绝对路径，须落在本路由前缀内——语义校验在
+		// validateFileRoute）。隐式启用桥接。
+		s, err := parseTomlString(val, lineNo, key)
+		if err != nil {
+			return err
+		}
+		if !strings.HasPrefix(s, "/") || len(s) > maxGatePathLen {
+			return fmt.Errorf("第 %d 行：auth_bridge_gate 须为以 / 开头的绝对路径且不超过 %d 字符：%q", lineNo, maxGatePathLen, s)
+		}
+		if rt.AuthBridge == nil {
+			rt.AuthBridge = &AuthBridge{}
+		}
+		rt.AuthBridge.GatePath = s
+	case "auth_bridge_gate_key":
+		// 门控密钥（URL 安全字符集，16-128 位）。隐式启用桥接。
+		s, err := parseTomlString(val, lineNo, key)
+		if err != nil {
+			return err
+		}
+		if !validGateKey(s) {
+			return fmt.Errorf("第 %d 行：auth_bridge_gate_key 须为 %d-%d 位 URL 安全字符 [A-Za-z0-9_-]：%q", lineNo, minGateKeyLen, maxGateKeyLen, s)
+		}
+		if rt.AuthBridge == nil {
+			rt.AuthBridge = &AuthBridge{}
+		}
+		rt.AuthBridge.GateKey = s
 	case "public_host":
 		// 对外 Host 修复目标（host_fix，见 hostfix.go）：入站 Host 为
 		// 发布网关寻址形态时改写为此外域名（== 浏览器 Origin），让
@@ -208,7 +250,7 @@ func applyRouteField(rt *Route, key, val string, lineNo int) error {
 		}
 		rt.PublicHost = s
 	default:
-		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout/auth_bridge/auth_bridge_scheme/auth_bridge_cookie/public_host）", lineNo, key)
+		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout/auth_bridge/auth_bridge_scheme/auth_bridge_cookie/auth_bridge_token/auth_bridge_gate/auth_bridge_gate_key/public_host）", lineNo, key)
 	}
 	return nil
 }
@@ -248,6 +290,11 @@ func validateFileRoute(rt *Route, lineNo int) error {
 	}
 	if rt.AuthBridge != nil && !validAuthBridgeCookieName(rt.AuthBridge.CookieName) {
 		return fmt.Errorf("第 %d 行：auth_bridge_cookie 含非法字符（分隔符/控制字符/非 ASCII）", lineNo)
+	}
+	if rt.AuthBridge != nil {
+		if reason := authBridgeStaticReason(rt.AuthBridge, rt.Prefix); reason != "" {
+			return fmt.Errorf("第 %d 行：%s", lineNo, reason)
+		}
 	}
 	if rt.PublicHost != "" && !validPublicHost(rt.PublicHost) {
 		return fmt.Errorf("第 %d 行：public_host 不是合法 hostname", lineNo)

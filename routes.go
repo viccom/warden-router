@@ -88,6 +88,22 @@ type AuthBridge struct {
 	// 改写成 "/"（实测），多路由桥接时同名 cookie 会互相覆盖，故
 	// 按路由配不同名；缺省用 authBridgeCookieDefault。
 	CookieName string `json:"cookie_name,omitempty"`
+	// Token 静态注入的 token 值（非空=静态模式）。用于无登录 API 的
+	// 上游（warden：token 是静态预共享密钥，UI 只发 Authorization 头，
+	// 没有"登录响应种 cookie"的桥接机会）。静态模式下请求侧带有效
+	// 门控 cookie 时，用本值覆盖 Authorization 头。必须与 GatePath/
+	// GateKey 成三件套配置（缺一即拒绝），杜绝"无条件注入"把上游
+	// 完全控制权裸暴露公网。
+	Token string `json:"token,omitempty"`
+	// GatePath 门控路径（绝对路径，须位于本路由前缀之内，如
+	// "/warden/.gate"）。命中且查询参数 k 等于 GateKey 时，种门控
+	// cookie 并 302 回前缀；否则 403。路径本身不是秘密（可探测），
+	// GateKey 才是。
+	GatePath string `json:"gate_path,omitempty"`
+	// GateKey 门控密钥：URL 安全字符 [A-Za-z0-9_-]，16-128 位。
+	// 换取门控 cookie 的凭据；warden 场景下"拿到分享链接 + 知道
+	// GateKey"双条件才可获得公网控制权。轮换=改本值 + reload。
+	GateKey string `json:"gate_key,omitempty"`
 }
 
 // Effective 返回上游看到的路径。
@@ -188,6 +204,11 @@ func validRoute(r *Route) bool {
 	}
 	// cookie 名含分隔符会破坏 Set-Cookie 结构
 	if r.AuthBridge != nil && !validAuthBridgeCookieName(r.AuthBridge.CookieName) {
+		return false
+	}
+	// 静态注入三件套：token/gate/gate_key 要么全配要么全不配，
+	// 且 gate 必须落在本路由前缀内（门控请求要能被本路由 Lookup 命中）
+	if r.AuthBridge != nil && !validAuthBridgeStatic(r.AuthBridge, r.Prefix) {
 		return false
 	}
 	// public_host 非合法 hostname（URL 形态/控制字符）会把畸形 Host

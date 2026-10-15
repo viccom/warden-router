@@ -279,5 +279,10 @@ func handleAll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "not found", "hint": "visit / for navigation"})
 		return
 	}
+	// 静态注入模式的门控路径（auth_bridge_token 三件套）：命中即
+	// 换 cookie / 403，不转发上游。其余请求走正常代理。
+	if handleAuthGate(w, r, rt) {
+		return
+	}
 	proxyTo(w, r, rt)
 }
