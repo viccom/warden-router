@@ -8,7 +8,10 @@
 ## 构建与测试
 
 需要 **Go ≥ 1.27**（go.mod 要求；系统自带 go1.21 会报 toolchain 不可用）。
-工具链装在 `/usr/local/go1.27`（容器层，沙箱重建后会丢；重装包持久化于
+工具链装在 `/usr/local/go1.27`（容器层，沙箱重建后会丢）。**国内镜像下载，勿直连
+go.dev（慢）**：`https://mirrors.aliyun.com/golang/go1.27.2.linux-amd64.tar.gz`
+（sha256 `ecbadb99091a3f46e31f5f934b068b1864eafa7995211b39eaddf76996045fe5`，
+已与官方 go.dev 校验一致；备选镜像 mirrors.nju.edu.cn/golang/；重装包持久化于
 `/workspace/warden/dist/go1.27.2.linux-amd64.tar.gz`）。构建时显式指定：
 
 ```sh
