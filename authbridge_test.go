@@ -317,3 +317,129 @@ func TestValidAuthBridgeScheme(t *testing.T) {
 		}
 	}
 }
+
+// B12 cookie 名校验
+func TestValidAuthBridgeCookieName(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"", true},
+		{"_wrauth", true},
+		{"_wrauth-api", true},
+		{"a;b", false},  // 分号截断 Set-Cookie
+		{"a=b", false},  // 等号歧义
+		{"a b", false},  // 空格
+		{"a,b", false},  // 逗号
+		{"a\"b", false}, // 引号
+	}
+	for _, tc := range cases {
+		if got := validAuthBridgeCookieName(tc.in); got != tc.want {
+			t.Errorf("validAuthBridgeCookieName(%q) = %v，期望 %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// B13 自定义 cookie 名：登录种的是配置名，请求也只认配置名
+func TestAuthBridge_CustomCookieName(t *testing.T) {
+	up := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":200,"data":{"token":"tok.custom"}}`)
+	}
+	srv, seen := bridgeChain(t, "/api/", &AuthBridge{Scheme: "Bearer", CookieName: "_wrauth-api"}, up)
+
+	resp, err := http.Post(srv.URL+"/api/login", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if c := resp.Header.Get("Set-Cookie"); !strings.Contains(c, "_wrauth-api=tok.custom") {
+		t.Fatalf("应种配置的 cookie 名：%q", c)
+	}
+
+	// 默认名的 cookie 不被识别（隔离性）
+	req, _ := http.NewRequest("GET", srv.URL+"/api/networks", nil)
+	req.Header.Set("Cookie", "_wrauth=tok.default")
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if *seen != "" {
+		t.Errorf("默认名 cookie 不应被恢复：%q", *seen)
+	}
+
+	// 配置名恢复
+	req2, _ := http.NewRequest("GET", srv.URL+"/api/networks", nil)
+	req2.Header.Set("Cookie", "_wrauth-api=tok.custom")
+	resp3, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if *seen != "Bearer tok.custom" {
+		t.Errorf("配置名应恢复：%q", *seen)
+	}
+}
+
+// B14 双路由不同 cookie 名共存：网关把两条 Set-Cookie 的 Path 都改成
+// "/" 后，同名 cookie 会互相覆盖——不同名则各自登录态互不干扰
+// （用户同时开 vnts-admin 与 openlist 两个标签页的场景）。
+func TestAuthBridge_TwoRoutesIsolation(t *testing.T) {
+	var seenA, seenB string
+	upA := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenA = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":200,"data":{"token":"token-A"}}`)
+	})
+	upB := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenB = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":200,"data":{"token":"token-B"}}`)
+	})
+	hostA, portA, _ := authBridgeUpstream(t, upA)
+	hostB, portB, _ := authBridgeUpstream(t, upB)
+
+	tb := NewRouteTable()
+	tb.SetStatic([]*Route{
+		{Prefix: "/api/", Host: hostA, Port: portA, Mode: ModeKeep, Name: "a",
+			AuthBridge: &AuthBridge{Scheme: "Bearer", CookieName: "_wrauth-a"}},
+		{Prefix: "/openlist/", Host: hostB, Port: portB, Mode: ModeKeep, Name: "b",
+			AuthBridge: &AuthBridge{Scheme: "", CookieName: "_wrauth-b"}},
+	})
+	t.Cleanup(swapTable(tb))
+	srv := httptest.NewServer(recoverMiddleware(loggingMiddleware(http.HandlerFunc(handleAll))))
+	t.Cleanup(srv.Close)
+
+	// 两个服务各登录一次，拿到两条 cookie（模拟网关把 Path 都改成 /）
+	respA, _ := http.Post(srv.URL+"/api/login", "application/json", strings.NewReader(`{}`))
+	respA.Body.Close()
+	respB, _ := http.Post(srv.URL+"/openlist/api/auth/login", "application/json", strings.NewReader(`{}`))
+	respB.Body.Close()
+	cookieA := respA.Header.Get("Set-Cookie")
+	cookieB := respB.Header.Get("Set-Cookie")
+	if !strings.HasPrefix(cookieA, "_wrauth-a=") || !strings.HasPrefix(cookieB, "_wrauth-b=") {
+		t.Fatalf("两条 cookie 名应不同：A=%q B=%q", cookieA, cookieB)
+	}
+	nameVal := func(c string) string {
+		return strings.SplitN(strings.SplitN(c, ";", 2)[0], "=", 2)[1]
+	}
+	both := "_wrauth-a=" + nameVal(cookieA) + "; _wrauth-b=" + nameVal(cookieB)
+
+	// 同时带两条 cookie 访问两个服务：各自恢复各自的 token
+	reqA, _ := http.NewRequest("GET", srv.URL+"/api/networks", nil)
+	reqA.Header.Set("Cookie", both)
+	respA2, _ := http.DefaultClient.Do(reqA)
+	respA2.Body.Close()
+	reqB, _ := http.NewRequest("GET", srv.URL+"/openlist/api/me", nil)
+	reqB.Header.Set("Cookie", both)
+	respB2, _ := http.DefaultClient.Do(reqB)
+	respB2.Body.Close()
+
+	if seenA != "Bearer token-A" {
+		t.Errorf("A 应恢复自己的 token，得到 %q", seenA)
+	}
+	if seenB != "token-B" {
+		t.Errorf("B 应恢复自己的裸 token，得到 %q", seenB)
+	}
+}

@@ -180,8 +180,23 @@ func applyRouteField(rt *Route, key, val string, lineNo int) error {
 			rt.AuthBridge = &AuthBridge{}
 		}
 		rt.AuthBridge.Scheme = s
+	case "auth_bridge_cookie":
+		// 桥接 cookie 名。发布网关会把 Set-Cookie 的 Path 统一改成 "/"，
+		// 多路由桥接时同名 cookie 互相覆盖，故按路由配不同名。
+		// 同样隐式启用桥接。
+		s, err := parseTomlString(val, lineNo, key)
+		if err != nil {
+			return err
+		}
+		if !validAuthBridgeCookieName(s) {
+			return fmt.Errorf("第 %d 行：auth_bridge_cookie 含非法字符（分隔符/控制字符/非 ASCII）：%q", lineNo, s)
+		}
+		if rt.AuthBridge == nil {
+			rt.AuthBridge = &AuthBridge{}
+		}
+		rt.AuthBridge.CookieName = s
 	default:
-		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout/auth_bridge/auth_bridge_scheme）", lineNo, key)
+		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout/auth_bridge/auth_bridge_scheme/auth_bridge_cookie）", lineNo, key)
 	}
 	return nil
 }
@@ -218,6 +233,9 @@ func validateFileRoute(rt *Route, lineNo int) error {
 	}
 	if rt.AuthBridge != nil && !validAuthBridgeScheme(rt.AuthBridge.Scheme) {
 		return fmt.Errorf("第 %d 行：auth_bridge_scheme 含非法字符（空格/控制字符/非 ASCII）", lineNo)
+	}
+	if rt.AuthBridge != nil && !validAuthBridgeCookieName(rt.AuthBridge.CookieName) {
+		return fmt.Errorf("第 %d 行：auth_bridge_cookie 含非法字符（分隔符/控制字符/非 ASCII）", lineNo)
 	}
 	return nil
 }

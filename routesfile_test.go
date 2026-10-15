@@ -396,6 +396,7 @@ port = 39871
 mode = "keep"
 auth_bridge = true
 auth_bridge_scheme = "Bearer"
+auth_bridge_cookie = "_wrauth-vnts"
 
 [[route]]
 prefix = "/openlist/"
@@ -427,6 +428,9 @@ auth_bridge_scheme = "Bearer"
 	if res.Routes[0].AuthBridge == nil || res.Routes[0].AuthBridge.Scheme != "Bearer" {
 		t.Errorf("route[0] auth_bridge 错：%+v", res.Routes[0].AuthBridge)
 	}
+	if res.Routes[0].AuthBridge.CookieName != "_wrauth-vnts" {
+		t.Errorf("route[0] cookie 名错：%+v", res.Routes[0].AuthBridge)
+	}
 	if res.Routes[1].AuthBridge == nil || res.Routes[1].AuthBridge.Scheme != "" {
 		t.Errorf("route[1] 应启用且 scheme 为空串（原样 token）：%+v", res.Routes[1].AuthBridge)
 	}
@@ -441,6 +445,7 @@ auth_bridge_scheme = "Bearer"
 		{"布尔拼错", "[[route]]\nprefix = \"/x/\"\nauth_bridge = \"yes\"\n", "第 3 行"},
 		{"scheme 带空格", "[[route]]\nprefix = \"/x/\"\nauth_bridge_scheme = \"Two Words\"\n", "第 3 行"},
 		{"scheme 未加引号", "[[route]]\nprefix = \"/x/\"\nauth_bridge_scheme = Bearer\n", "第 3 行"},
+		{"cookie 名带分号", "[[route]]\nprefix = \"/x/\"\nauth_bridge_cookie = \"a;b\"\n", "第 3 行"},
 	}
 	for _, tc := range bads {
 		t.Run(tc.name, func(t *testing.T) {

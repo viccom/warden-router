@@ -77,6 +77,10 @@ type AuthBridge struct {
 	// Scheme 恢复 Authorization 头时的前缀："Bearer"（vnts2 JWT）或
 	// ""（OpenList：token 原样放入头，无 Bearer 前缀）。
 	Scheme string `json:"scheme,omitempty"`
+	// CookieName 桥接 cookie 名。发布网关会把 Set-Cookie 的 Path 统一
+	// 改写成 "/"（实测），多路由桥接时同名 cookie 会互相覆盖，故
+	// 按路由配不同名；缺省用 authBridgeCookieDefault。
+	CookieName string `json:"cookie_name,omitempty"`
 }
 
 // Effective 返回上游看到的路径。
@@ -173,6 +177,10 @@ func validRoute(r *Route) bool {
 	}
 	// auth_bridge scheme 非法（空格/CRLF/非 ASCII）会破坏上游收到的头结构
 	if r.AuthBridge != nil && !validAuthBridgeScheme(r.AuthBridge.Scheme) {
+		return false
+	}
+	// cookie 名含分隔符会破坏 Set-Cookie 结构
+	if r.AuthBridge != nil && !validAuthBridgeCookieName(r.AuthBridge.CookieName) {
 		return false
 	}
 	return true

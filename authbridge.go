@@ -29,9 +29,10 @@ import (
 	"strings"
 )
 
-// authBridgeCookieName 桥接 cookie 名。值按 Path 隔离在不同挂载点内，
-// 故全局一个名字即可（不会串台：浏览器只把 Path 匹配的 cookie 发回来）。
-const authBridgeCookieName = "_wrauth"
+// authBridgeCookieDefault 默认桥接 cookie 名。发布网关会把 Set-Cookie 的
+// Path 统一改写成 "/"（第三方上下文 cookie 化），多路由桥接时同名 cookie
+// 会互相覆盖——故生产部署按路由配不同名字（auth_bridge_cookie）。
+const authBridgeCookieDefault = "_wrauth"
 
 // authBridgeMaxBody 只读小于此大小的 JSON 响应体（登录响应仅数百字节）。
 // 超过则放弃桥接，避免把大响应整体缓冲进内存。
@@ -52,13 +53,17 @@ const authBridgeMaxAge = 24 * 60 * 60
 // **每个**转发请求注入自己的平台 JWT（Authorization: Bearer <iss=
 // cloudstudio.net 的 JWT>）。客户端浏览器发出的真 token 头到达 router
 // 前就被替换成了这个假 token，"有头就跳过"会把平台 JWT 当客户端原值
-// 放行，上游收到的必然 401。桥接 cookie 是本域 HttpOnly + Path 隔离的
-// 登录态，比任何透传头都可信，故覆盖。
+// 放行，上游收到的必然 401。桥接 cookie 是本域 HttpOnly 的登录态，
+// 比任何透传头都可信，故覆盖。
 func restoreAuthHeader(pr *httputil.ProxyRequest, rt *Route) {
 	if rt == nil || rt.AuthBridge == nil {
 		return
 	}
-	c, err := pr.In.Cookie(authBridgeCookieName)
+	name := rt.AuthBridge.CookieName
+	if name == "" {
+		name = authBridgeCookieDefault
+	}
+	c, err := pr.In.Cookie(name)
 	if err != nil || c.Value == "" {
 		return
 	}
@@ -109,7 +114,11 @@ func bridgeLoginCookie(resp *http.Response, rt *Route) {
 		return // 非登录响应（业务 JSON 也常是 200），不种 cookie
 	}
 
-	cookie := authBridgeCookieName + "=" + token +
+	name := rt.AuthBridge.CookieName
+	if name == "" {
+		name = authBridgeCookieDefault
+	}
+	cookie := name + "=" + token +
 		"; Path=" + rt.Prefix +
 		"; Max-Age=" + itoa(authBridgeMaxAge) +
 		"; HttpOnly; SameSite=Lax"
@@ -183,6 +192,25 @@ func validAuthBridgeScheme(s string) bool {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c <= ' ' || c >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// validAuthBridgeCookieName 校验 cookie 名（RFC 6265 token：可见 ASCII
+// 且不含分隔符 , ; = 空格等——分号会截断 Set-Cookie，等号会歧义）。
+func validAuthBridgeCookieName(s string) bool {
+	if s == "" {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= ' ' || c >= 0x7f {
+			return false
+		}
+		switch c {
+		case ',', ';', '=', '"', '\\':
 			return false
 		}
 	}
