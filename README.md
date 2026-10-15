@@ -7,15 +7,14 @@
 
 ## 构建与测试
 
-需要 **Go ≥ 1.27**（go.mod 要求；系统自带 go1.21 会报 toolchain 不可用）。
-工具链装在 `/usr/local/go1.27`（容器层，沙箱重建后会丢）。**国内镜像下载，勿直连
-go.dev（慢）**：`https://mirrors.aliyun.com/golang/go1.27.2.linux-amd64.tar.gz`
-（sha256 `ecbadb99091a3f46e31f5f934b068b1864eafa7995211b39eaddf76996045fe5`，
-已与官方 go.dev 校验一致；备选镜像 mirrors.nju.edu.cn/golang/；重装包持久化于
-`/workspace/warden/dist/go1.27.2.linux-amd64.tar.gz`）。构建时显式指定：
+需要 **Go ≥ 1.27**（go.mod 要求）。本机系统 Go 即 **1.27.2**（`/usr/local/go`，
+旧版 1.21.4 已彻底移除；沙箱重建后 `autostart.sh` 从持久包自动补装——
+`/workspace/warden/dist/go1.27.2.linux-amd64.tar.gz`，国内镜像源
+**mirrors.aliyun.com/golang/**（备选 mirrors.nju.edu.cn/golang/，勿直连 go.dev，慢），
+sha256 `ecbadb99091a3f46e31f5f934b068b1864eafa7995211b39eaddf76996045fe5`
+已与官方校验一致）。直接构建：
 
 ```sh
-export GOROOT=/usr/local/go1.27 PATH=/usr/local/go1.27/bin:$PATH
 go build -o build/warden-route-go .   # 产物输出到 build/（不进源码树）
 go test -race -count=5 ./...          # 全量测试（表驱动 + 真 TCP 集成）
 gofmt -l . && go vet ./...
