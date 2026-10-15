@@ -134,6 +134,11 @@ var sharedProxy = &httputil.ReverseProxy{
 		pr.Out.URL.Path = rt.Effective(pr.In.URL.Path)
 		pr.Out.URL.RawPath = ""
 		pr.Out.URL.RawQuery = pr.In.URL.RawQuery
+		// auth_bridge：CloudStudio 网关会往每个转发请求注入自己的平台
+		// JWT（Authorization: Bearer <iss=cloudstudio.net>），客户端真
+		// token 头到达前就被替换。带桥接 cookie 时用 cookie 值覆盖恢复
+		// （登录响应侧种的，见 bridgeLoginCookie）。
+		restoreAuthHeader(pr, rt)
 		// Host 头必须原样透传浏览器的值（反向代理标准语义，与 Python 版
 		// router.py:294 的显式处理一致）：上游 kula 的 WS 同源校验拿 Origin
 		// 与 Host 比对，改写 Host 会把所有浏览器 WS 连接判成跨站 403

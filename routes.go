@@ -66,6 +66,17 @@ type Route struct {
 	// 不能用 context deadline（会掐死 WS/流式），由 routingTransport
 	// 按路由选带 ResponseHeaderTimeout 的 http.Transport 实现。
 	ResponseHeaderTimeout Duration `json:"response_header_timeout,omitempty"`
+	// AuthBridge 授权头桥接（nil=不启用）。应对发布网关剥离客户端
+	// Authorization 头的 workaround：登录响应种 cookie、请求侧恢复头。
+	// 详见 authbridge.go。与 Mode 正交（keep/strip 均可配置）。
+	AuthBridge *AuthBridge `json:"auth_bridge,omitempty"`
+}
+
+// AuthBridge 授权头桥接配置（见 authbridge.go 的背景说明）。
+type AuthBridge struct {
+	// Scheme 恢复 Authorization 头时的前缀："Bearer"（vnts2 JWT）或
+	// ""（OpenList：token 原样放入头，无 Bearer 前缀）。
+	Scheme string `json:"scheme,omitempty"`
 }
 
 // Effective 返回上游看到的路径。
@@ -158,6 +169,10 @@ func validRoute(r *Route) bool {
 	}
 	// 每路由响应头超时：0=不设；上界 5m（防误配把慢上游永久判死）
 	if r.ResponseHeaderTimeout < 0 || r.ResponseHeaderTimeout > Duration(maxRouteTimeout) {
+		return false
+	}
+	// auth_bridge scheme 非法（空格/CRLF/非 ASCII）会破坏上游收到的头结构
+	if r.AuthBridge != nil && !validAuthBridgeScheme(r.AuthBridge.Scheme) {
 		return false
 	}
 	return true

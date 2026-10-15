@@ -22,10 +22,19 @@ import (
 func rewriteResponse(resp *http.Response) error {
 	rt, ok := resp.Request.Context().Value(routeCtxKey{}).(*Route)
 	if !ok || rt == nil || rt.Mode != ModeStrip {
-		return nil // 无路由上下文 / ModeKeep：一律不碰
+		// 无路由上下文 / ModeKeep：Set-Cookie/Location 重写一律不碰
+		// （kula/ttyd 类自带 base_path，路径是全站视角，动了反而坏）。
+		// 注意 auth_bridge 与 Mode 正交，下面的桥接不受此分支影响。
+		if rt != nil {
+			bridgeLoginCookie(resp, rt)
+		}
+		return nil
 	}
 	rewriteSetCookie(resp, rt.Prefix)
 	rewriteLocation(resp, rt)
+	// bridge 放在最后：自种的 cookie 带最终 Path（前缀），不被
+	// rewriteSetCookie 二次加前缀。
+	bridgeLoginCookie(resp, rt)
 	return nil
 }
 

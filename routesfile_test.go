@@ -386,3 +386,68 @@ hidden = "yes"
 		t.Errorf("hidden = \"yes\" 应为致命语法错误")
 	}
 }
+
+// AB1 auth_bridge / auth_bridge_scheme 解析（含隐式启用与致命错误）
+func TestParseRoutesFile_AuthBridge(t *testing.T) {
+	toml := `[[route]]
+prefix = "/api/"
+host = "127.0.0.1"
+port = 39871
+mode = "keep"
+auth_bridge = true
+auth_bridge_scheme = "Bearer"
+
+[[route]]
+prefix = "/openlist/"
+host = "127.0.0.1"
+port = 5244
+mode = "keep"
+auth_bridge = true
+auth_bridge_scheme = ""
+
+[[route]]
+prefix = "/plain/"
+host = "127.0.0.1"
+port = 8080
+auth_bridge = false
+
+[[route]]
+prefix = "/implicit/"
+host = "127.0.0.1"
+port = 8081
+auth_bridge_scheme = "Bearer"
+`
+	res, err := parseRoutes([]byte(toml))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(res.Routes) != 4 || len(res.Warnings) != 0 {
+		t.Fatalf(" Routes=%d Warnings=%v", len(res.Routes), res.Warnings)
+	}
+	if res.Routes[0].AuthBridge == nil || res.Routes[0].AuthBridge.Scheme != "Bearer" {
+		t.Errorf("route[0] auth_bridge 错：%+v", res.Routes[0].AuthBridge)
+	}
+	if res.Routes[1].AuthBridge == nil || res.Routes[1].AuthBridge.Scheme != "" {
+		t.Errorf("route[1] 应启用且 scheme 为空串（原样 token）：%+v", res.Routes[1].AuthBridge)
+	}
+	if res.Routes[2].AuthBridge != nil {
+		t.Errorf("route[2] auth_bridge=false 应为 nil")
+	}
+	if res.Routes[3].AuthBridge == nil || res.Routes[3].AuthBridge.Scheme != "Bearer" {
+		t.Errorf("route[3] 配 scheme 应隐式启用：%+v", res.Routes[3].AuthBridge)
+	}
+
+	bads := []struct{ name, toml, want string }{
+		{"布尔拼错", "[[route]]\nprefix = \"/x/\"\nauth_bridge = \"yes\"\n", "第 3 行"},
+		{"scheme 带空格", "[[route]]\nprefix = \"/x/\"\nauth_bridge_scheme = \"Two Words\"\n", "第 3 行"},
+		{"scheme 未加引号", "[[route]]\nprefix = \"/x/\"\nauth_bridge_scheme = Bearer\n", "第 3 行"},
+	}
+	for _, tc := range bads {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseRoutes([]byte(tc.toml))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("应报致命错误（含 %q），得到 %v", tc.want, err)
+			}
+		})
+	}
+}

@@ -155,8 +155,33 @@ func applyRouteField(rt *Route, key, val string, lineNo int) error {
 			return fmt.Errorf("第 %d 行：response_header_timeout 不是合法 duration：%q", lineNo, s)
 		}
 		rt.ResponseHeaderTimeout = Duration(d)
+	case "auth_bridge":
+		// 授权头桥接开关（布尔裸字面量，同 hidden 的严格性）
+		switch val {
+		case "true":
+			rt.AuthBridge = &AuthBridge{}
+		case "false":
+			rt.AuthBridge = nil
+		default:
+			return fmt.Errorf("第 %d 行：auth_bridge 必须是 true/false，得到 %q", lineNo, val)
+		}
+	case "auth_bridge_scheme":
+		// 恢复 Authorization 头的前缀："Bearer" 或 ""（原样 token）。
+		// 隐式启用桥接（配了 scheme 即视为 auth_bridge = true），
+		// 免得两个键必须成对出现。
+		s, err := parseTomlString(val, lineNo, key)
+		if err != nil {
+			return err
+		}
+		if !validAuthBridgeScheme(s) {
+			return fmt.Errorf("第 %d 行：auth_bridge_scheme 含非法字符（空格/控制字符/非 ASCII）：%q", lineNo, s)
+		}
+		if rt.AuthBridge == nil {
+			rt.AuthBridge = &AuthBridge{}
+		}
+		rt.AuthBridge.Scheme = s
 	default:
-		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout）", lineNo, key)
+		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout/auth_bridge/auth_bridge_scheme）", lineNo, key)
 	}
 	return nil
 }
@@ -190,6 +215,9 @@ func validateFileRoute(rt *Route, lineNo int) error {
 	}
 	if rt.ResponseHeaderTimeout < 0 || rt.ResponseHeaderTimeout > Duration(maxRouteTimeout) {
 		return fmt.Errorf("第 %d 行：response_header_timeout 越界（0-5m）", lineNo)
+	}
+	if rt.AuthBridge != nil && !validAuthBridgeScheme(rt.AuthBridge.Scheme) {
+		return fmt.Errorf("第 %d 行：auth_bridge_scheme 含非法字符（空格/控制字符/非 ASCII）", lineNo)
 	}
 	return nil
 }
