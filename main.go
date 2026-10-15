@@ -139,12 +139,15 @@ var sharedProxy = &httputil.ReverseProxy{
 		// token 头到达前就被替换。带桥接 cookie 时用 cookie 值覆盖恢复
 		// （登录响应侧种的，见 bridgeLoginCookie）。
 		restoreAuthHeader(pr, rt)
-		// Host 头必须原样透传浏览器的值（反向代理标准语义，与 Python 版
-		// router.py:294 的显式处理一致）：上游 kula 的 WS 同源校验拿 Origin
-		// 与 Host 比对，改写 Host 会把所有浏览器 WS 连接判成跨站 403
-		// （CSWSH 防护误伤，实测 /monitor/ws 101 → 403）。缺失时
-		// （HTTP/1.0 无 Host）留空，net/http 自动回退为上游地址。
-		pr.Out.Host = pr.In.Host
+		// Host 头默认原样透传（反向代理标准语义，与 Python 版
+		// router.py:294 的显式处理一致）：上游 kula 的 WS 同源校验拿
+		// Origin 与 Host 比对。但发布网关会把入站 Host 改写为内部
+		// 寻址形态（9000-<key>.e2b.<region>...，X-Forwarded-Host 亦
+		// 被改写、不保留浏览器原值），此时透传即把改写值送给上游，
+		// 校验必败——配了 public_host 的路由按 host_fix 改写为对外
+		// 域名（== 浏览器 Origin）。缺失时（HTTP/1.0 无 Host）留空，
+		// net/http 自动回退为上游地址。详见 hostfix.go。
+		pr.Out.Host = fixedHost(pr.In.Host, rt)
 		pr.SetXForwarded()
 	},
 	// 响应重写 funnel：Set-Cookie Path / Location 前缀修复。

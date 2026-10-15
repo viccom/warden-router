@@ -70,6 +70,13 @@ type Route struct {
 	// Authorization 头的 workaround：登录响应种 cookie、请求侧恢复头。
 	// 详见 authbridge.go。与 Mode 正交（keep/strip 均可配置）。
 	AuthBridge *AuthBridge `json:"auth_bridge,omitempty"`
+	// PublicHost 对外 Host 修复（""=不启用）。发布网关会把入站 Host
+	// 改写为内部寻址形态（9000-<key>.e2b.<region>.sandbox.cloudstudio.club，
+	// 见 hostfix.go），上游做 Origin 校验的服务（kula WS）必然 403。
+	// 配了本字段且入站 Host 确为网关形态时，发给上游的 Host 改写为
+	// 本值（== 浏览器 Origin），校验自然通过。与 AuthBridge 同构：
+	// 恢复被网关破坏的请求语义，按路由 opt-in。
+	PublicHost string `json:"public_host,omitempty"`
 }
 
 // AuthBridge 授权头桥接配置（见 authbridge.go 的背景说明）。
@@ -181,6 +188,11 @@ func validRoute(r *Route) bool {
 	}
 	// cookie 名含分隔符会破坏 Set-Cookie 结构
 	if r.AuthBridge != nil && !validAuthBridgeCookieName(r.AuthBridge.CookieName) {
+		return false
+	}
+	// public_host 非合法 hostname（URL 形态/控制字符）会把畸形 Host
+	// 送给上游
+	if r.PublicHost != "" && !validPublicHost(r.PublicHost) {
 		return false
 	}
 	return true

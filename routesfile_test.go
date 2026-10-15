@@ -456,3 +456,41 @@ auth_bridge_scheme = "Bearer"
 		})
 	}
 }
+
+// HF1 public_host 解析（host_fix）：正常值进 Route；URL 形态/端口/
+// 未加引号均为致命错误（防把畸形 Host 送给上游）
+func TestParseRoutesFile_PublicHost(t *testing.T) {
+	toml := `[[route]]
+prefix = "/monitor/"
+host = "127.0.0.1"
+port = 27960
+mode = "keep"
+public_host = "ad8584f64ca039337.app.workbuddy.host"
+`
+	res, err := parseRoutes([]byte(toml))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(res.Routes) != 1 || len(res.Warnings) != 0 {
+		t.Fatalf("Routes=%d Warnings=%v", len(res.Routes), res.Warnings)
+	}
+	if res.Routes[0].PublicHost != "ad8584f64ca039337.app.workbuddy.host" {
+		t.Errorf("public_host 错：%q", res.Routes[0].PublicHost)
+	}
+
+	bads := []struct{ name, toml, want string }{
+		{"URL 形态", "[[route]]\nprefix = \"/x/\"\npublic_host = \"https://a.example.com\"\n", "public_host"},
+		{"带端口", "[[route]]\nprefix = \"/x/\"\npublic_host = \"a.example.com:8443\"\n", "public_host"},
+		{"带路径", "[[route]]\nprefix = \"/x/\"\npublic_host = \"a.example.com/monitor\"\n", "public_host"},
+		{"未加引号", "[[route]]\nprefix = \"/x/\"\npublic_host = a.example.com\n", "第 3 行"},
+		{"空串", "[[route]]\nprefix = \"/x/\"\npublic_host = \"\"\n", "public_host"},
+	}
+	for _, tc := range bads {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseRoutes([]byte(tc.toml))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("应报致命错误（含 %q），得到 %v", tc.want, err)
+			}
+		})
+	}
+}

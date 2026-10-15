@@ -195,8 +195,20 @@ func applyRouteField(rt *Route, key, val string, lineNo int) error {
 			rt.AuthBridge = &AuthBridge{}
 		}
 		rt.AuthBridge.CookieName = s
+	case "public_host":
+		// 对外 Host 修复目标（host_fix，见 hostfix.go）：入站 Host 为
+		// 发布网关寻址形态时改写为此外域名（== 浏览器 Origin），让
+		// 上游的 Origin 同源校验自然通过。合法 hostname，禁 URL 形态。
+		s, err := parseTomlString(val, lineNo, key)
+		if err != nil {
+			return err
+		}
+		if !validPublicHost(s) {
+			return fmt.Errorf("第 %d 行：public_host 不是合法 hostname（仅字母/数字/点/横线，禁 scheme/path/端口）：%q", lineNo, s)
+		}
+		rt.PublicHost = s
 	default:
-		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout/auth_bridge/auth_bridge_scheme/auth_bridge_cookie）", lineNo, key)
+		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout/auth_bridge/auth_bridge_scheme/auth_bridge_cookie/public_host）", lineNo, key)
 	}
 	return nil
 }
@@ -236,6 +248,9 @@ func validateFileRoute(rt *Route, lineNo int) error {
 	}
 	if rt.AuthBridge != nil && !validAuthBridgeCookieName(rt.AuthBridge.CookieName) {
 		return fmt.Errorf("第 %d 行：auth_bridge_cookie 含非法字符（分隔符/控制字符/非 ASCII）", lineNo)
+	}
+	if rt.PublicHost != "" && !validPublicHost(rt.PublicHost) {
+		return fmt.Errorf("第 %d 行：public_host 不是合法 hostname", lineNo)
 	}
 	return nil
 }
