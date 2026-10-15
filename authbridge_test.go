@@ -307,7 +307,7 @@ func TestValidAuthBridgeScheme(t *testing.T) {
 		{"Bearer", true},
 		{"bearer", true},
 		{"Basic", true},
-		{"Two Words", false},  // 空格破坏头结构
+		{"Two Words", false},   // 空格破坏头结构
 		{"Bad\nHeader", false}, // CRLF 头注入
 		{"中文", false},          // 非 ASCII
 	}
