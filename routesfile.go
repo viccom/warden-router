@@ -249,8 +249,21 @@ func applyRouteField(rt *Route, key, val string, lineNo int) error {
 			return fmt.Errorf("第 %d 行：public_host 不是合法 hostname（仅字母/数字/点/横线，禁 scheme/path/端口）：%q", lineNo, s)
 		}
 		rt.PublicHost = s
+	case "host_fix_origin":
+		// 以请求 Origin 头恢复上游 Host（host_fix 的 Trae 变体，见
+		// hostfix.go）：入站 Host 被改写成对本机地址、公网域名每会话
+		// 动态不可静态配置时，用浏览器 Origin（公网域名）还原上游 Host。
+		// 布尔裸字面量，同 hidden 的严格性。
+		switch val {
+		case "true":
+			rt.HostFixOrigin = true
+		case "false":
+			rt.HostFixOrigin = false
+		default:
+			return fmt.Errorf("第 %d 行：host_fix_origin 必须是 true/false，得到 %q", lineNo, val)
+		}
 	default:
-		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout/auth_bridge/auth_bridge_scheme/auth_bridge_cookie/auth_bridge_token/auth_bridge_gate/auth_bridge_gate_key/public_host）", lineNo, key)
+		return fmt.Errorf("第 %d 行：未知字段 %q（允许：prefix/host/port/mode/display/desc/icon/hidden/response_header_timeout/auth_bridge/auth_bridge_scheme/auth_bridge_cookie/auth_bridge_token/auth_bridge_gate/auth_bridge_gate_key/public_host/host_fix_origin）", lineNo, key)
 	}
 	return nil
 }

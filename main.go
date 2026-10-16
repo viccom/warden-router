@@ -141,14 +141,41 @@ var sharedProxy = &httputil.ReverseProxy{
 		restoreAuthHeader(pr, rt)
 		// Host 头默认原样透传（反向代理标准语义，与 Python 版
 		// router.py:294 的显式处理一致）：上游 kula 的 WS 同源校验拿
-		// Origin 与 Host 比对。但发布网关会把入站 Host 改写为内部
-		// 寻址形态（9000-<key>.e2b.<region>...，X-Forwarded-Host 亦
-		// 被改写、不保留浏览器原值），此时透传即把改写值送给上游，
-		// 校验必败——配了 public_host 的路由按 host_fix 改写为对外
-		// 域名（== 浏览器 Origin）。缺失时（HTTP/1.0 无 Host）留空，
-		// net/http 自动回退为上游地址。详见 hostfix.go。
-		pr.Out.Host = fixedHost(pr.In.Host, rt)
+		// Origin 与 Host 比对。但平台会把入站 Host 改写为内部形态：
+		// CloudStudio 是 9000-<key>.e2b.<region>...（X-Forwarded-Host
+		// 亦被改写、不保留浏览器原值）；Trae 预览代理则是本机地址
+		// localhost:<port>。此时透传即把改写值送给上游，校验必败——
+		// public_host 按网关形态改写为静态对外域名；host_fix_origin
+		// 按浏览器侧的公网 URL 改写。来源择优：Origin 优先，缺失时回退
+		// Referer（同源子资源 GET 浏览器不带 Origin，但默认 Referrer-Policy
+		// 会带完整 Referer）——两者都经 publicOriginHost 校验后才采用。
+		// 缺失时（HTTP/1.0 无 Host）留空，net/http 自动回退为上游地址。
+		// 详见 hostfix.go。
+		src := pr.In.Header.Get("Origin")
+		if src == "" {
+			src = pr.In.Header.Get("Referer")
+		}
+		fixed := fixedHost(pr.In.Host, src, rt)
+		pr.Out.Host = fixed
 		pr.SetXForwarded()
+		// X-Forwarded-Host 必须与裁决后的 Host 一致：上游（OpenList 等）
+		// 反推对外 URL 时**优先读 XFH**，若把它留成平台改写后的入站内网
+		// Host（localhost:<port>），即使 Host 已修正，上游仍会生成内网绝对
+		// 链接（实测 2026-10-16：Host=公网域名 + XFH=localhost:9100 →
+		// raw_url 仍为 http://localhost:9100/…）。故放在 SetXForwarded 之后
+		// 覆盖。未改写时 fixed == 入站 Host，与 SetXForwarded 的结果相同，
+		// 行为零变化。
+		if fixed != "" {
+			pr.Out.Header.Set("X-Forwarded-Host", fixed)
+			// X-Forwarded-Proto 同理：上游（OpenList 等）按它决定绝对链接的
+			// scheme。平台入站是明文（TLS 已在平台侧终止），不覆盖则上游
+			// 生成 http:// 链接，在 https 页面上触发混合内容。以浏览器侧
+			// 来源（Origin/Referer）的 scheme 为准（实测 2026-10-16：
+			// XFP=https → https://…，XFP=http/缺省 → http://…）。
+			if s := originScheme(src); s != "" {
+				pr.Out.Header.Set("X-Forwarded-Proto", s)
+			}
+		}
 	},
 	// 响应重写 funnel：Set-Cookie Path / Location 前缀修复。
 	// ReverseProxy 对 101 升级不触发 ModifyResponse，WS 路径零影响。

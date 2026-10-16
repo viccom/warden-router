@@ -78,6 +78,12 @@ type Route struct {
 	// 本值（== 浏览器 Origin），校验自然通过。与 AuthBridge 同构：
 	// 恢复被网关破坏的请求语义，按路由 opt-in。
 	PublicHost string `json:"public_host,omitempty"`
+	// HostFixOrigin 以请求 Origin 头恢复上游 Host（false=不启用，见
+	// hostfix.go）。用于"平台把入站 Host 改写成对本机地址、对外域名
+	// 每会话动态"的通道（如 Trae 预览代理：入站 Host=localhost:9100，
+	// 浏览器 Origin=公网域名，无法静态配 public_host）。与 PublicHost
+	// 正交；两者同时满足条件时 PublicHost 优先。
+	HostFixOrigin bool `json:"host_fix_origin,omitempty"`
 }
 
 // AuthBridge 授权头桥接配置（见 authbridge.go 的背景说明）。
