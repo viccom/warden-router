@@ -156,10 +156,17 @@ func handleAuthGate(w http.ResponseWriter, r *http.Request, rt *Route) bool {
 		return true
 	}
 	name := authBridgeCookieName(rt.AuthBridge)
+	// Path 固定 "/"（而非 rt.Prefix）：warden UI 是全内联单页，API 用
+	// **根绝对路径**（/api/v1/...，它假设自己部署在域名根下），而 UI 自身
+	// 挂在 /warden/ 前缀下——cookie 只种前缀内的话，浏览器对 /api/v1/
+	// 请求根本不发，注入无从发生（2026-10-16 实测踩坑：jar 里有 cookie、
+	// 请求头里没有）。全局 Path 无副作用：cookie 名独立（_wrauth-gate）
+	// 且值是 HMAC 标记，其他路由收到也不认；且发布网关本来就会把
+	// Set-Cookie Path 改写成 "/"（auth_bridge 历史实测），公网现实即全局。
 	http.SetCookie(w, &http.Cookie{
 		Name:     name,
 		Value:    gateCookieValue(rt.AuthBridge),
-		Path:     rt.Prefix,
+		Path:     "/",
 		MaxAge:   authBridgeMaxAge,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,

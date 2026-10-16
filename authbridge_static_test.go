@@ -99,7 +99,7 @@ func TestStaticGate_CorrectKeySetsCookie(t *testing.T) {
 	c := cookies[0]
 	want := gateCookieValue(staticGateAB())
 	for _, part := range []string{
-		"_wrauth-gate=" + want, "Path=/warden/", "HttpOnly", "SameSite=Lax", "Max-Age=86400",
+		"_wrauth-gate=" + want, "Path=/;", "HttpOnly", "SameSite=Lax", "Max-Age=86400",
 	} {
 		if !strings.Contains(c, part) {
 			t.Errorf("cookie %q 缺少 %q", c, part)
@@ -448,5 +448,92 @@ func TestValidAuthBridge_LoginFieldsUnaffected(t *testing.T) {
 	}
 	if !validRoute(r) {
 		t.Errorf("登录流配置应仍然合法")
+	}
+}
+
+// S10 回归（2026-10-16 实测踩坑）：warden UI 是全内联单页，API 用根绝对
+// 路径 /api/v1/...（与 UI 所在的 /warden/ 前缀是两条不同路由）。门控
+// cookie 必须 Path=/ 且两条路由都配三件套，否则浏览器对 /api/v1/ 请求
+// 不发 cookie、注入也不发生——症状是"cookie 种上了但 UI 仍 401"。
+func TestStaticInject_APIRouteSharesTrio(t *testing.T) {
+	var seenAuthAPI, seenAuthOther string
+	var hitsAPI, hitsOther int
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			hitsAPI++
+			seenAuthAPI = r.Header.Get("Authorization")
+		} else {
+			hitsOther++
+			seenAuthOther = r.Header.Get("Authorization")
+		}
+		okJSON(w, r)
+	})
+	upHost, upPort, _ := authBridgeUpstream(t, up)
+
+	ab := staticGateAB()
+	tb := NewRouteTable()
+	tb.SetStatic([]*Route{
+		{Prefix: "/warden/", Host: upHost, Port: upPort, Mode: ModeKeep, Name: "warden", AuthBridge: ab},
+		{Prefix: "/api/v1/", Host: upHost, Port: upPort, Mode: ModeKeep, Name: "warden", AuthBridge: ab},
+		// 第三条路由不配三件套：同 cookie 不得被注入
+		{Prefix: "/other/", Host: upHost, Port: upPort, Mode: ModeKeep, Name: "other"},
+	})
+	t.Cleanup(swapTable(tb))
+
+	srv := httptest.NewServer(recoverMiddleware(loggingMiddleware(http.HandlerFunc(handleAll))))
+	t.Cleanup(srv.Close)
+
+	// 门控换 cookie（Path=/，浏览器后续对所有路径都会发）
+	resp, err := noRedirectClient().Get(srv.URL + "/warden/.gate?k=0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("门控状态码 = %d，期望 302", resp.StatusCode)
+	}
+	var cookieVal string
+	for _, c := range resp.Header["Set-Cookie"] {
+		if strings.HasPrefix(c, "_wrauth-gate=") {
+			cookieVal = strings.TrimPrefix(c, "_wrauth-gate=")
+			if idx := strings.Index(cookieVal, ";"); idx >= 0 {
+				cookieVal = cookieVal[:idx]
+			}
+		}
+	}
+	if cookieVal == "" {
+		t.Fatal("未取到门控 cookie 值")
+	}
+
+	// UI 的 API 路径（另一条路由、同三件套）+ 平台 JWT → 应被注入
+	req, _ := http.NewRequest("GET", srv.URL+"/api/v1/services", nil)
+	req.Header.Set("Authorization", platformJWT)
+	req.Header.Set("Cookie", "_wrauth-gate="+cookieVal)
+	resp2, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if hitsAPI != 1 {
+		t.Fatalf("/api/v1/ 路由命中 %d 次，期望 1", hitsAPI)
+	}
+	if got := seenAuthAPI; got != "Bearer warden-static-token" {
+		t.Errorf("/api/v1/ 路由收到 Authorization = %q，期望注入 %q", got, "Bearer warden-static-token")
+	}
+
+	// 未配三件套的路由：带同 cookie 也不注入
+	req2, _ := http.NewRequest("GET", srv.URL+"/other/x", nil)
+	req2.Header.Set("Authorization", platformJWT)
+	req2.Header.Set("Cookie", "_wrauth-gate="+cookieVal)
+	resp3, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp3.Body.Close()
+	if hitsOther != 1 {
+		t.Fatalf("/other/ 路由命中 %d 次，期望 1", hitsOther)
+	}
+	if got := seenAuthOther; got != platformJWT {
+		t.Errorf("/other/ 路由收到 Authorization = %q，期望原样 %q（无三件套不注入）", got, platformJWT)
 	}
 }
