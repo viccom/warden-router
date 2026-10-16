@@ -27,6 +27,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -131,6 +132,31 @@ func gateCookieValue(ab *AuthBridge) string {
 	return hex.EncodeToString(mac.Sum(nil))[:32]
 }
 
+// gatePromptHTML 门控密钥输入页。极简自包含（无外部资源），form GET
+// 提交到门控路径自身（?k=<输入>）。errMsg 非空时顶部红字提示（403 重试）。
+// gatePath 来自配置，插入 HTML 属性前必须转义。
+func gatePromptHTML(gatePath, errMsg string) string {
+	esc := html.EscapeString(gatePath)
+	msg := ""
+	if errMsg != "" {
+		msg = `<p style="color:#e05252;margin:0 0 14px">` + html.EscapeString(errMsg) + `</p>`
+	}
+	return `<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>warden 管理台 · 密钥验证</title></head>
+<body style="font-family:system-ui,sans-serif;background:#141821;color:#d8dee9;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+<div style="background:#1c2230;border:1px solid #2a3347;border-radius:10px;padding:32px;width:340px">
+<h2 style="margin:0 0 6px;font-size:18px">warden 管理台</h2>
+<p style="margin:0 0 18px;color:#8a94a6;font-size:13px">公网访问需先验证管理密钥（验证后 24 小时内免输）</p>
+` + msg + `
+<form method="get" action="` + esc + `">
+<input type="password" name="k" placeholder="管理密钥（token）" autofocus
+ style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #2a3347;border-radius:6px;background:#12161f;color:#d8dee9;font-size:14px">
+<button type="submit" style="width:100%;margin-top:12px;padding:10px;border:0;border-radius:6px;background:#3b82f6;color:#fff;font-size:14px;cursor:pointer">进入管理台</button>
+</form>
+</div></body></html>`
+}
+
 // handleAuthGate 处理静态模式门控路径。返回 true 表示已处理完毕
 // （调用方不应再转发）。仅当路由配了静态三件套且请求路径恰好等于
 // GatePath 时介入；其余请求原样放行转发。
@@ -151,8 +177,21 @@ func handleAuthGate(w http.ResponseWriter, r *http.Request, rt *Route) bool {
 		return true
 	}
 	got := r.URL.Query().Get("k")
-	if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(rt.AuthBridge.GateKey)) != 1 {
-		http.Error(w, "forbidden: invalid gate key", http.StatusForbidden)
+	if got == "" {
+		// 无密钥 → 密钥输入页（全新浏览器的登录入口）。warden UI 的
+		// token 输入框在公网不可用（网关把 Authorization 头替换为平台
+		// JWT，用户输入到不了上游），故登录动作收敛到本页：粘贴 token
+		// 提交 → 302 种 cookie → 进入。token 即 GateKey（生产配置两者
+		// 同值），心智统一。
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, gatePromptHTML(rt.AuthBridge.GatePath, ""))
+		return true
+	}
+	if subtle.ConstantTimeCompare([]byte(got), []byte(rt.AuthBridge.GateKey)) != 1 {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, gatePromptHTML(rt.AuthBridge.GatePath, "密钥无效，请重试"))
 		return true
 	}
 	name := authBridgeCookieName(rt.AuthBridge)

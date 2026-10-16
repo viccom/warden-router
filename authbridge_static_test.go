@@ -110,7 +110,7 @@ func TestStaticGate_CorrectKeySetsCookie(t *testing.T) {
 	}
 }
 
-// G2 错误密钥 → 403，不种 cookie，上游不被命中
+// G2 错误密钥 → 403 错误页（含重试输入框），不种 cookie，上游不被命中
 func TestStaticGate_WrongKeyForbidden(t *testing.T) {
 	srv, _, hits := gateChain(t, staticGateAB(), okJSON)
 
@@ -122,6 +122,10 @@ func TestStaticGate_WrongKeyForbidden(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("状态码 = %d，期望 403", resp.StatusCode)
 	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `name="k"`) {
+		t.Errorf("403 错误页应含重试输入框，得到：%s", body)
+	}
 	if c := resp.Header["Set-Cookie"]; len(c) != 0 {
 		t.Errorf("不应种 cookie，得到 %v", c)
 	}
@@ -130,8 +134,9 @@ func TestStaticGate_WrongKeyForbidden(t *testing.T) {
 	}
 }
 
-// G3 缺密钥 → 403
-func TestStaticGate_MissingKeyForbidden(t *testing.T) {
+// G3 无密钥 → 200 密钥输入页（全新浏览器的登录入口：粘贴 token 提交
+// 即换 cookie；URL 不泄露信息，密钥经 GET form 提交）
+func TestStaticGate_MissingKeyShowsPrompt(t *testing.T) {
 	srv, _, hits := gateChain(t, staticGateAB(), okJSON)
 
 	resp, err := noRedirectClient().Get(srv.URL + "/warden/.gate")
@@ -139,11 +144,20 @@ func TestStaticGate_MissingKeyForbidden(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("状态码 = %d，期望 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（输入页）", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	for _, want := range []string{`action="/warden/.gate"`, `name="k"`, `type="password"`} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("输入页缺少 %q，得到：%s", want, body)
+		}
+	}
+	if c := resp.Header["Set-Cookie"]; len(c) != 0 {
+		t.Errorf("输入页不应种 cookie，得到 %v", c)
 	}
 	if *hits != 0 {
-		t.Errorf("上游被命中 %d 次，403 不应转发", *hits)
+		t.Errorf("上游被命中 %d 次，输入页不应转发", *hits)
 	}
 }
 
