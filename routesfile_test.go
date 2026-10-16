@@ -230,7 +230,7 @@ func TestFileRoutes_Reload(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer swapTable(NewRouteTable())() // reload 内部以 staticRoutes() 为基线，先隔离
-	fr := &fileRoutes{path: path}
+	fr := &fileRoutes{path: path, table: table}
 
 	// 首次加载：file 生效 + code static 基线保留
 	if err := fr.reload(); err != nil {
@@ -278,7 +278,7 @@ func TestFileRoutes_CorruptKeepsPrevious(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer swapTable(NewRouteTable())()
-	fr := &fileRoutes{path: path}
+	fr := &fileRoutes{path: path, table: table}
 	if err := fr.reload(); err != nil {
 		t.Fatalf("首次 reload: %v", err)
 	}
@@ -304,7 +304,7 @@ func TestFileRoutes_SIGHUP(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer swapTable(NewRouteTable())()
-	fr := &fileRoutes{path: path}
+	fr := &fileRoutes{path: path, table: table}
 	if err := fr.reload(); err != nil {
 		t.Fatalf("首次 reload: %v", err)
 	}

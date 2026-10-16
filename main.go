@@ -207,7 +207,7 @@ func main() {
 
 	// 4) routes.toml 声明式路由：mtime 热加载 + SIGHUP 立即重载。
 	//    与代码静态路由合并，同前缀文件优先；语法错误保留上一版。
-	fr := &fileRoutes{path: *routesFile}
+	fr := &fileRoutes{path: *routesFile, table: table}
 	go fr.watch(*routesSecs)
 	fr.handleSignals(nil) // 同步注册 SIGHUP，立即返回
 

@@ -20,6 +20,13 @@ go test -race -count=5 ./...          # 全量测试（表驱动 + 真 TCP 集�
 gofmt -l . && go vet ./...
 ```
 
+## 平台网关适配（重要）
+
+本程序部署在 WorkBuddy 沙箱的 CloudStudio 发布网关之后。该网关会改写
+Host、**替换 Authorization 头为平台 JWT**、对 WS 有 h1 要求等——凡"公网
+401/403 而本地正常"的问题，先读 **[`docs/cloudstudio-gateway.md`](docs/cloudstudio-gateway.md)**
+（网关行为清单 + 逐项适配实现 + 三层对照排障范式）。
+
 ## 部署
 
 - warden 托管：`/workspace/warden/config/services.toml` 的 `web-gateway` 条目，

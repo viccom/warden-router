@@ -356,8 +356,14 @@ func (t *RouteTable) MergeFileRoutes(file []*Route) {
 }
 
 // fileRoutes 管理 routes.toml 的加载与热加载。
+//
+// table 依赖注入（2026-10-16 审查）：reload 原先直接读包级全局 table，
+// 而测试的 swapTable 会并发替换该全局 → data race（SIGHUP goroutine 与
+// 测试收尾并发）。改为持有构造时注入的实例引用：消除全局耦合，也让
+// reload 语义与"操作哪张表"显式绑定。
 type fileRoutes struct {
-	path string
+	path  string
+	table *RouteTable
 }
 
 // reload 重读文件并生效。返回值语义（watcher/SIGHUP 共用）：
@@ -368,17 +374,20 @@ func (fr *fileRoutes) reload() error {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// 文件被删：回退到仅 code static
-			table.SetStatic(staticRoutes())
+			fr.table.SetStatic(staticRoutes())
 			log.Printf("[route] routes 文件不存在，回退仅代码静态路由：%s", fr.path)
 			return nil
 		}
 		return err // 损坏/语法错误：保留上一版
 	}
 	// 先按 code static 重建（抹掉上一版 file 路由，防漂移），再合并新版
-	table.SetStatic(staticRoutes())
-	table.MergeFileRoutes(res.Routes)
+	fr.table.SetStatic(staticRoutes())
+	fr.table.MergeFileRoutes(res.Routes)
 	for _, w := range res.Warnings {
 		log.Printf("[route] routes 文件警告：%s", w)
+	}
+	for _, w := range fr.table.GateShadowWarnings() {
+		log.Printf("[route] 门控遮蔽告警：%s", w)
 	}
 	log.Printf("[route] routes 文件已生效：%d 条", len(res.Routes))
 	return nil

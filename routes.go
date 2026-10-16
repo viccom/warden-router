@@ -23,6 +23,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"sort"
@@ -370,6 +371,52 @@ func (t *RouteTable) Cards() []*Route {
 		}
 		return out[i].Name < out[j].Name
 	})
+	return out
+}
+
+// GateShadowWarnings 返回"门控路径被更长前缀路由遮蔽"的告警文本列表。
+// Lookup 是最长前缀优先：若某路由的 gate 路径同时匹配另一条更长前缀的
+// 路由，门控请求会被那条路由抢走——门控永不生效（fail-closed，无注入
+// 风险，但属静默误配）。启动/重载期调用并记日志，把静默失效变显式
+// （2026-10-16 审查收尾；harness 原则：约束结果形态而非静默）。
+func (t *RouteTable) GateShadowWarnings() []string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	all := map[string]*Route{}
+	for _, m := range []map[string]*Route{t.static, t.dynamic, t.discovered} {
+		for p, r := range m {
+			all[p] = r
+		}
+	}
+	var out []string
+	for _, r := range all {
+		gate := ""
+		if r.AuthBridge != nil {
+			gate = r.AuthBridge.GatePath
+		}
+		if gate == "" {
+			continue
+		}
+		best := ""
+		var winner *Route
+		for p, c := range all {
+			if gate == strings.TrimSuffix(p, "/") || strings.HasPrefix(gate, p) {
+				if len(p) > len(best) {
+					best, winner = p, c
+				}
+			}
+		}
+		if winner != r {
+			got := "-"
+			if winner != nil {
+				got = winner.Prefix
+			}
+			out = append(out, fmt.Sprintf(
+				"门控 %s（路由 %s）被更长前缀 %s 遮蔽：门控将不生效，请调整 auth_bridge_gate",
+				gate, r.Prefix, got))
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

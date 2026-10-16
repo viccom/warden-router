@@ -26,6 +26,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -183,9 +184,16 @@ func handleAuthGate(w http.ResponseWriter, r *http.Request, rt *Route) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 	case http.MethodPost:
-		// 输入页表单提交：限 4KB 防滥用；解析失败按"无密钥"处理（回输入页）
+		// 输入页表单提交：限 4KB 防滥用。超限显式 413（不再静默当作
+		// "无密钥"回输入页，语义明确）；其余解析失败按无密钥处理。
 		r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
-		_ = r.ParseForm()
+		if err := r.ParseForm(); err != nil {
+			var mbe *http.MaxBytesError
+			if errors.As(err, &mbe) {
+				http.Error(w, "request entity too large", http.StatusRequestEntityTooLarge)
+				return true
+			}
+		}
 	default:
 		w.Header().Set("Allow", "GET, HEAD, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -446,13 +454,20 @@ func validGateKey(s string) bool {
 }
 
 // validGatePath 校验门控路径：以 / 开头、不超长、可见 ASCII（禁空格与
-// 控制字符——路径进 URL 与 HTML 属性，宽松字符集是未来误用的温床）。
+// 控制字符——路径进 URL 与 HTML 属性，宽松字符集是未来误用的温床）；
+// 额外禁 `?` 与 `#`：URL 解析后它们之后的内容分别属于 query/fragment，
+// **永远不出现在 r.URL.Path 里**——配了即门控永不匹配（静默失效），
+// 必须在配置期拒绝（2026-10-16 审查收尾）。
 func validGatePath(s string) bool {
 	if s == "" || len(s) > maxGatePathLen || s[0] != '/' {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
-		if s[i] <= ' ' || s[i] >= 0x7f {
+		c := s[i]
+		if c <= ' ' || c >= 0x7f {
+			return false
+		}
+		if c == '?' || c == '#' {
 			return false
 		}
 	}

@@ -719,3 +719,91 @@ func TestStaticInject_APIRouteSharesTrio(t *testing.T) {
 		t.Errorf("/other/ 路由收到 Authorization = %q，期望原样 %q（无三件套不注入）", got, platformJWT)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 审查收尾加固（2026-10-16）
+// ---------------------------------------------------------------------------
+
+// A1 GatePath 含 ?/#/空白 → 校验拒绝（这类字符在 URL 解析后永远不出现在
+// r.URL.Path 里，配了即门控静默失效——必须拒绝，不能等运行时才发现）
+func TestValidGatePath_RejectsQueryAndFragment(t *testing.T) {
+	cases := []struct {
+		path string
+		ok   bool
+	}{
+		{"/warden/.gate", true},
+		{"/a/b-c_d/.g", true},
+		{"/warden/.gate?x=1", false},  // ? 之后是 query，永不进 Path
+		{"/warden/.gate#frag", false}, // # 之后是 fragment，永不进 Path
+		{"/warden/.ga te", false},     // 空白
+		{"warden/.gate", false},       // 无前导 /
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := validGatePath(c.path); got != c.ok {
+			t.Errorf("validGatePath(%q) = %v，期望 %v", c.path, got, c.ok)
+		}
+	}
+	// 经配置校验路径同样拒绝
+	ab := &AuthBridge{Token: "tok", Scheme: "Bearer", GatePath: "/warden/.gate?x=1", GateKey: "0123456789abcdef"}
+	if validRoute(&Route{Prefix: "/warden/", Host: "127.0.0.1", Port: 8789, Mode: ModeStrip, AuthBridge: ab}) {
+		t.Error("含 ? 的 gate_path 应被 validRoute 拒绝")
+	}
+}
+
+// A2 POST body 超限 → 413（不再静默当作"无密钥"回输入页，语义明确）
+func TestStaticGate_PostBodyTooLarge(t *testing.T) {
+	srv, _, hits := gateChain(t, staticGateAB(), okJSON)
+
+	req, _ := http.NewRequest("POST", srv.URL+"/warden/.gate",
+		strings.NewReader(strings.Repeat("k=", 8<<10)))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("状态码 = %d，期望 413", resp.StatusCode)
+	}
+	if *hits != 0 {
+		t.Errorf("上游被命中 %d 次，413 不应转发", *hits)
+	}
+}
+
+// A3 门控路径被更长前缀遮蔽 → 启动期显式告警（原为静默失效）
+func TestGateShadowWarnings(t *testing.T) {
+	host, port, _, closeUp := upstream(t, func(w http.ResponseWriter, r *http.Request) {})
+	defer closeUp()
+
+	issuer := staticGateAB() // gate=/warden/.gate
+	tb := NewRouteTable()
+	tb.SetStatic([]*Route{
+		{Prefix: "/warden/", Host: host, Port: port, Mode: ModeStrip, Name: "warden", AuthBridge: issuer},
+		// 更长前缀把 /warden/sub/.gate 抢走（gate 配在该前缀内，但 /warden/sub/
+		// 自身也是路由）→ 该 gate 永不生效
+		{Prefix: "/warden/sub/", Host: host, Port: port, Mode: ModeStrip, Name: "sub"},
+		{Prefix: "/warden/sub/", Host: host, Port: port, Mode: ModeStrip, Name: "sub"},
+	})
+	// 用一个 gate 落在被遮蔽位置的配置
+	shadowed := &AuthBridge{Token: "tok", Scheme: "Bearer", GatePath: "/warden/sub/.gate", GateKey: "0123456789abcdef"}
+	tb.SetStatic([]*Route{
+		{Prefix: "/warden/", Host: host, Port: port, Mode: ModeStrip, Name: "warden", AuthBridge: shadowed},
+		{Prefix: "/warden/sub/", Host: host, Port: port, Mode: ModeStrip, Name: "sub"},
+	})
+	defer swapTable(tb)()
+
+	warns := table.GateShadowWarnings()
+	if len(warns) != 1 || !strings.Contains(warns[0], "/warden/sub/.gate") {
+		t.Fatalf("应告警 gate 被遮蔽，得到 %v", warns)
+	}
+
+	// 无遮蔽场景（gate 在前缀内且无更长前缀竞争）→ 零告警
+	tb.SetStatic([]*Route{
+		{Prefix: "/warden/", Host: host, Port: port, Mode: ModeStrip, Name: "warden", AuthBridge: staticGateAB()},
+		{Prefix: "/api/v1/", Host: host, Port: port, Mode: ModeKeep, Name: "warden"},
+	})
+	if warns := table.GateShadowWarnings(); len(warns) != 0 {
+		t.Errorf("无遮蔽应零告警，得到 %v", warns)
+	}
+}
