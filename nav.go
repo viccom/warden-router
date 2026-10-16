@@ -143,6 +143,16 @@ func sourceLabel(src string) string {
 // 导航页渲染
 // ---------------------------------------------------------------------------
 
+// navLink 返回导航卡片的打开链接。静态注入路由（auth_bridge 三件套，
+// 见 authbridge.go）直达门控路径——卡片即公网登录入口（落地 302 回前缀
+// 并种 24h cookie）；其余路由打开前缀本身。
+func navLink(c *Route) string {
+	if c.AuthBridge != nil && c.AuthBridge.Token != "" && c.AuthBridge.GatePath != "" {
+		return c.AuthBridge.GatePath
+	}
+	return c.Prefix
+}
+
 // writeNav 导航宫格页。**所有插值字段一律转义**——Icon/Prefix/Display 来自
 // 用户可写的动态路由，漏一个就是存储型 XSS。
 func writeNav(w http.ResponseWriter, r *http.Request) {
@@ -176,7 +186,7 @@ func writeNav(w http.ResponseWriter, r *http.Request) {
 			`<span class="b"><span class="dot %s"></span>`+
 			`<span class="p">%s</span><span class="src">%s</span>`+
 			`<span class="go" aria-hidden="true">↗</span></span></a>`,
-			htmlEsc(c.Prefix), htmlEsc(c.Prefix), i, htmlEsc(c.Prefix),
+			htmlEsc(navLink(c)), htmlEsc(c.Prefix), i, htmlEsc(c.Prefix),
 			htmlEsc(icon), htmlEsc(disp), desc,
 			htmlEsc(h), htmlEsc(c.Prefix), htmlEsc(sourceLabel(c.Source)))
 	}

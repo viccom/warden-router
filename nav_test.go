@@ -238,3 +238,38 @@ func TestNav_HealthNormalized(t *testing.T) {
 		t.Error("非法健康值应归一为 unknown")
 	}
 }
+
+// NAV-GATE 静态注入路由（auth_bridge 三件套）的导航卡片链接自动指向
+// 门控路径——卡片即公网登录入口（落地 302 回前缀并种 cookie）。普通
+// 路由仍打开前缀本身（2026-10-16，warden 卡片直达 /warden/.gate）。
+func TestNav_StaticGateCardLinksToGatePath(t *testing.T) {
+	host, port, _, closeUp := upstream(t, func(w http.ResponseWriter, r *http.Request) {})
+	defer closeUp()
+	tb := NewRouteTable()
+	tb.SetStatic([]*Route{
+		{
+			Prefix: "/warden/", Host: host, Port: port, Mode: ModeStrip,
+			Name: "warden", Display: "Warden 管理台",
+			AuthBridge: &AuthBridge{
+				Token: "tok", Scheme: "Bearer",
+				GatePath: "/warden/.gate", GateKey: "0123456789abcdef",
+			},
+		},
+		{Prefix: "/plain/", Host: host, Port: port, Mode: ModeStrip, Display: "普通"},
+	})
+	defer swapTable(tb)()
+
+	rec := httptest.NewRecorder()
+	writeNav(rec, httptest.NewRequest("GET", "/", nil))
+	out := rec.Body.String()
+	if !strings.Contains(out, `href="/warden/.gate"`) {
+		t.Errorf("静态注入路由卡片应指向门控路径 href=/warden/.gate")
+	}
+	if !strings.Contains(out, `href="/plain/"`) {
+		t.Errorf("普通路由卡片应保持前缀 href=/plain/")
+	}
+	// data-prefix 仍为路由前缀（JS 增量刷新按前缀对齐）
+	if !strings.Contains(out, `data-prefix="/warden/"`) {
+		t.Errorf("data-prefix 应保持路由前缀 /warden/（增量刷新 key）")
+	}
+}
