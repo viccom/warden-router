@@ -45,7 +45,7 @@ func handleRoutesAPI(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, 200, map[string]any{"routes": table.GetDynamic()})
+		writeJSON(w, 200, map[string]any{"routes": redactRouteCredentials(table.GetDynamic())})
 
 	case http.MethodPost, http.MethodPut:
 		var rt Route
@@ -123,4 +123,31 @@ func subtleEqual(a, b string) bool {
 		v |= a[i] ^ b[i]
 	}
 	return v == 0
+}
+
+// redactRouteCredentials 序列化前抹除路由凭据（Token/GateKey 不回显，
+// 2026-10-16 审查发现：/_routes 的 GET 会把动态路由的 AuthBridge 原样
+// 输出，含明文 token/gate_key）。用 "***" 占位而非空串：保留"已配置"
+// 信息；且该值不满足 validGateKey 的 16 位下限，即便被 PUT 回显值也会
+// 被 validRoute 拒绝，不会覆盖真凭据（双向防误用）。
+// 返回浅拷贝切片 + 内部 AuthBridge 深拷贝，不改动路由表状态。
+func redactRouteCredentials(rs []*Route) []*Route {
+	out := make([]*Route, 0, len(rs))
+	for _, r := range rs {
+		if r.AuthBridge == nil {
+			out = append(out, r)
+			continue
+		}
+		c := *r
+		ab := *r.AuthBridge
+		if ab.Token != "" {
+			ab.Token = "***"
+		}
+		if ab.GateKey != "" {
+			ab.GateKey = "***"
+		}
+		c.AuthBridge = &ab
+		out = append(out, &c)
+	}
+	return out
 }

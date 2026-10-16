@@ -217,8 +217,8 @@ func applyRouteField(rt *Route, key, val string, lineNo int) error {
 		if err != nil {
 			return err
 		}
-		if !strings.HasPrefix(s, "/") || len(s) > maxGatePathLen {
-			return fmt.Errorf("第 %d 行：auth_bridge_gate 须为以 / 开头的绝对路径且不超过 %d 字符：%q", lineNo, maxGatePathLen, s)
+		if !validGatePath(s) {
+			return fmt.Errorf("第 %d 行：auth_bridge_gate 须为以 / 开头的绝对路径（可见 ASCII、不超过 %d 字符）：%q", lineNo, maxGatePathLen, s)
 		}
 		if rt.AuthBridge == nil {
 			rt.AuthBridge = &AuthBridge{}

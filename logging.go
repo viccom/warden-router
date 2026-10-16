@@ -72,8 +72,10 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		route := "-"
+		var matched *Route
 		if rt, ok := table.Lookup(r.URL.Path); ok {
 			route = rt.Prefix
+			matched = rt
 		}
 		metrics.enter(route)
 		rec := &statusRecorder{ResponseWriter: w}
@@ -85,9 +87,22 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			}
 			metrics.leave(route, r.Method, status, dur)
 			log.Printf("[access] %s %s -> %s %d %s route=%s",
-				r.Method, r.URL.RequestURI(), status, rec.bytes,
+				r.Method, redactRequestURI(r, matched), status, rec.bytes,
 				dur.Round(time.Microsecond), route)
 		}()
 		next.ServeHTTP(rec, r)
 	})
+}
+
+// redactRequestURI 访问日志用的 URI：静态注入门控路径的查询串可能含
+// 密钥（GET ?k= 直链兼容形式），脱敏为纯路径——凭据不进日志（2026-10-16
+// 审查发现；输入页表单已改 POST，此为其兜底）。
+// rt 复用 middleware 已完成的 Lookup 结果（勿在此重查：每请求多一次
+// RWMutex 加锁 + 三表遍历，是高并发下的白付开销）。
+func redactRequestURI(r *http.Request, rt *Route) string {
+	if rt != nil && rt.AuthBridge != nil && rt.AuthBridge.GatePath != "" &&
+		r.URL.Path == rt.AuthBridge.GatePath && r.URL.RawQuery != "" {
+		return r.URL.Path
+	}
+	return r.URL.RequestURI()
 }

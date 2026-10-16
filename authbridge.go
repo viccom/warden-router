@@ -132,9 +132,10 @@ func gateCookieValue(ab *AuthBridge) string {
 	return hex.EncodeToString(mac.Sum(nil))[:32]
 }
 
-// gatePromptHTML 门控密钥输入页。极简自包含（无外部资源），form GET
-// 提交到门控路径自身（?k=<输入>）。errMsg 非空时顶部红字提示（403 重试）。
-// gatePath 来自配置，插入 HTML 属性前必须转义。
+// gatePromptHTML 门控密钥输入页。极简自包含（无外部资源），form **POST**
+// 提交到门控路径自身（密钥在 body，不进 URL/历史/Referer/访问日志）。
+// errMsg 非空时顶部红字提示（403 重试）。gatePath 来自配置，插入 HTML
+// 属性前必须转义。
 func gatePromptHTML(gatePath, errMsg string) string {
 	esc := html.EscapeString(gatePath)
 	msg := ""
@@ -143,14 +144,15 @@ func gatePromptHTML(gatePath, errMsg string) string {
 	}
 	return `<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>warden 管理台 · 密钥验证</title></head>
 <body style="font-family:system-ui,sans-serif;background:#141821;color:#d8dee9;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
 <div style="background:#1c2230;border:1px solid #2a3347;border-radius:10px;padding:32px;width:340px">
 <h2 style="margin:0 0 6px;font-size:18px">warden 管理台</h2>
 <p style="margin:0 0 18px;color:#8a94a6;font-size:13px">公网访问需先验证管理密钥（验证后 24 小时内免输）</p>
 ` + msg + `
-<form method="get" action="` + esc + `">
-<input type="password" name="k" placeholder="管理密钥（token）" autofocus
+<form method="post" action="` + esc + `">
+<input type="password" name="k" placeholder="管理密钥（token）" autofocus autocomplete="off"
  style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #2a3347;border-radius:6px;background:#12161f;color:#d8dee9;font-size:14px">
 <button type="submit" style="width:100%;margin-top:12px;padding:10px;border:0;border-radius:6px;background:#3b82f6;color:#fff;font-size:14px;cursor:pointer">进入管理台</button>
 </form>
@@ -158,43 +160,65 @@ func gatePromptHTML(gatePath, errMsg string) string {
 }
 
 // handleAuthGate 处理静态模式门控路径。返回 true 表示已处理完毕
-// （调用方不应再转发）。仅当路由配了静态三件套且请求路径恰好等于
-// GatePath 时介入；其余请求原样放行转发。
+// （调用方不应再转发）。仅当路由配了 token+key 且 GatePath 非空、
+// 请求路径恰好等于 GatePath 时介入；其余请求原样放行转发。
 //
 // 安全模型：GateKey 是唯一凭据（常量时间比对）——拿到分享链接的
 // 攻击者没有 Key 时：门控 403、业务路径无 cookie 不注入，上游
 // 收到平台 JWT 判 401，零控制权。
+//
+// 密钥传递路径（2026-10-16 审查加固）：
+//   - 输入页 form 用 **POST** 提交：密钥不进 URL/浏览器历史/Referer/
+//     访问日志（GET ?k= 仅作直链兼容保留，访问日志对其 query 脱敏）；
+//   - 成功响应 GET→302、POST→303（See Other，POST→GET 语义正确）；
+//   - 已持有效 cookie 免输：直接 302 回前缀（导航卡片恒指向 GatePath，
+//     若每次都逼重输，"24h 免输"形同虚设——审查发现）。
 func handleAuthGate(w http.ResponseWriter, r *http.Request, rt *Route) bool {
-	if rt == nil || rt.AuthBridge == nil || rt.AuthBridge.Token == "" {
+	if rt == nil || rt.AuthBridge == nil || rt.AuthBridge.GatePath == "" {
 		return false
 	}
 	if r.URL.Path != rt.AuthBridge.GatePath {
 		return false
 	}
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+	case http.MethodPost:
+		// 输入页表单提交：限 4KB 防滥用；解析失败按"无密钥"处理（回输入页）
+		r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+		_ = r.ParseForm()
+	default:
+		w.Header().Set("Allow", "GET, HEAD, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return true
 	}
+
 	got := r.URL.Query().Get("k")
+	if r.Method == http.MethodPost {
+		got = r.PostForm.Get("k")
+	}
+	name := authBridgeCookieName(rt.AuthBridge)
 	if got == "" {
-		// 无密钥 → 密钥输入页（全新浏览器的登录入口）。warden UI 的
-		// token 输入框在公网不可用（网关把 Authorization 头替换为平台
-		// JWT，用户输入到不了上游），故登录动作收敛到本页：粘贴 token
-		// 提交 → 302 种 cookie → 进入。token 即 GateKey（生产配置两者
-		// 同值），心智统一。
+		// 免输：已持有效门控 cookie → 直接回前缀（不再要求重输）
+		if c, err := r.Cookie(name); err == nil && c.Value != "" &&
+			subtle.ConstantTimeCompare([]byte(c.Value), []byte(gateCookieValue(rt.AuthBridge))) == 1 {
+			http.Redirect(w, r, gateRedirectLocation(rt, r), http.StatusFound)
+			return true
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Frame-Options", "DENY")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, gatePromptHTML(rt.AuthBridge.GatePath, ""))
 		return true
 	}
 	if subtle.ConstantTimeCompare([]byte(got), []byte(rt.AuthBridge.GateKey)) != 1 {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Frame-Options", "DENY")
 		w.WriteHeader(http.StatusForbidden)
 		_, _ = io.WriteString(w, gatePromptHTML(rt.AuthBridge.GatePath, "密钥无效，请重试"))
 		return true
 	}
-	name := authBridgeCookieName(rt.AuthBridge)
 	// Path 固定 "/"（而非 rt.Prefix）：warden UI 是全内联单页，API 用
 	// **根绝对路径**（/api/v1/...，它假设自己部署在域名根下），而 UI 自身
 	// 挂在 /warden/ 前缀下——cookie 只种前缀内的话，浏览器对 /api/v1/
@@ -211,15 +235,25 @@ func handleAuthGate(w http.ResponseWriter, r *http.Request, rt *Route) bool {
 		SameSite: http.SameSiteLaxMode,
 	})
 	// 302 回前缀，保留 sharecode 等其余查询参数（发布链接的访问凭据
-	// 可能挂在查询串上，剥 k 即可）。
+	// 可能挂在查询串上，剥 k 即可）。POST 提交用 303（See Other）：
+	// POST→GET 语义明确（浏览器随后以 GET 打开目标）。
+	code := http.StatusFound
+	if r.Method == http.MethodPost {
+		code = http.StatusSeeOther
+	}
+	http.Redirect(w, r, gateRedirectLocation(rt, r), code)
+	return true
+}
+
+// gateRedirectLocation 门控成功后的落点：路由前缀 + 原查询串（剥 k）。
+func gateRedirectLocation(rt *Route, r *http.Request) string {
 	q := r.URL.Query()
 	q.Del("k")
 	loc := rt.Prefix
 	if enc := q.Encode(); enc != "" {
 		loc += "?" + enc
 	}
-	http.Redirect(w, r, loc, http.StatusFound)
-	return true
+	return loc
 }
 
 // ---------------------------------------------------------------------------
@@ -411,16 +445,40 @@ func validGateKey(s string) bool {
 	return true
 }
 
-// authBridgeStaticReason 返回静态三件套的问题描述（""=无问题）。
+// validGatePath 校验门控路径：以 / 开头、不超长、可见 ASCII（禁空格与
+// 控制字符——路径进 URL 与 HTML 属性，宽松字符集是未来误用的温床）。
+func validGatePath(s string) bool {
+	if s == "" || len(s) > maxGatePathLen || s[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] <= ' ' || s[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// authBridgeStaticReason 返回静态注入配置的问题描述（""=无问题）。
 // validAuthBridgeStatic 与 routesfile 的条目级 warning 共用，保证
 // 在线 API 与磁盘加载的判定逻辑单一权威。
+//
+// 语义（2026-10-16 审查调整）：不变量是 **token ⟺ gate_key 双向绑定**
+// ——token 是注入值，gate_key 是门控 cookie 的 HMAC 锚（无 key 的 token
+// 可被伪造 cookie 触发 = 事实上的无条件注入，必须拒绝）；**gate_path
+// 可选**：配了才有门控入口（"发 cookie 路由"），不配即纯消费路由
+// （"UI 在子路径、API 在根路径"这类上游的第二条路由不需要也不该再开
+// 一个入口——否则 302 落到 API 根，体验错误）。
 func authBridgeStaticReason(ab *AuthBridge, prefix string) string {
 	hasToken, hasGate, hasKey := ab.Token != "", ab.GatePath != "", ab.GateKey != ""
 	if !hasToken && !hasGate && !hasKey {
 		return ""
 	}
-	if !hasToken || !hasGate || !hasKey {
-		return "auth_bridge 静态三件套（auth_bridge_token/auth_bridge_gate/auth_bridge_gate_key）须成对配置"
+	if hasToken != hasKey {
+		return "auth_bridge_token 与 auth_bridge_gate_key 必须同配（token 无 key 可被伪造 cookie 触发注入；key 无 token 无注入目标）"
+	}
+	if !hasToken {
+		return "auth_bridge_gate 须与 auth_bridge_token/auth_bridge_gate_key 同配（门控入口无消费方）"
 	}
 	if !validStaticToken(ab.Token) {
 		return "auth_bridge_token 含非法字符（空格/控制字符/非 ASCII）或为空/超长"
@@ -428,8 +486,11 @@ func authBridgeStaticReason(ab *AuthBridge, prefix string) string {
 	if !validGateKey(ab.GateKey) {
 		return "auth_bridge_gate_key 须为 16-128 位 URL 安全字符 [A-Za-z0-9_-]"
 	}
-	if !strings.HasPrefix(ab.GatePath, "/") || len(ab.GatePath) > maxGatePathLen {
-		return "auth_bridge_gate 须为以 / 开头的绝对路径且不超过 256 字符"
+	if !hasGate {
+		return "" // 消费型路由：只验 cookie 注入，不提供入口
+	}
+	if !validGatePath(ab.GatePath) {
+		return "auth_bridge_gate 须为以 / 开头的绝对路径（可见 ASCII、不超过 256 字符）"
 	}
 	// gate 必须在前缀内（否则 Lookup 命中不了本路由，门控永不生效），
 	// 且不能等于前缀本身（那会遮蔽路由 UI）。

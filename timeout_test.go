@@ -34,8 +34,11 @@ func timeoutSrv(t *testing.T, host string, port int, d Duration) *httptest.Serve
 
 // T1 配 100ms 超时 + 上游 300ms 才响应 → 快速失败得 5xx
 func TestTimeout_FastFail(t *testing.T) {
+	// 上游延迟 600ms（> 断言阈值 250ms 的 2 倍余量）：-race + 全包并发下
+	// 调度抖动曾把 250ms 阈值吃穿（既有 flaky，2026-10-16 审查发现），
+	// 拉开上游延迟让"快速失败"的语义断言稳定成立。
 	host, port, _, closeUp := upstream(t, func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(600 * time.Millisecond)
 		w.WriteHeader(http.StatusOK)
 	})
 	defer closeUp()

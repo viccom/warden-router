@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -192,11 +193,12 @@ func TestStaticGate_RedirectPreservesQuery(t *testing.T) {
 	}
 }
 
-// G6 非 GET/HEAD 方法 → 405（门控只服务浏览器导航）
+// G6 非 GET/HEAD/POST 方法 → 405（门控只服务导航/表单）
 func TestStaticGate_MethodNotAllowed(t *testing.T) {
 	srv, _, hits := gateChain(t, staticGateAB(), okJSON)
 
-	resp, err := http.Post(srv.URL+"/warden/.gate?k=0123456789abcdef", "", nil)
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/warden/.gate?k=0123456789abcdef", nil)
+	resp, err := noRedirectClient().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,6 +387,171 @@ func TestStaticMode_LoginFlowStillWorks(t *testing.T) {
 	}
 }
 
+// G7 免输：持有效门控 cookie 访问门控路径 → 直接 302 回前缀（不显示输入页）。
+// 导航卡片恒定指向 GatePath，若每次都逼重输，24h 免输形同虚设（审查发现）。
+func TestStaticGate_ValidCookieSkipsPrompt(t *testing.T) {
+	srv, _, hits := gateChain(t, staticGateAB(), okJSON)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/warden/.gate", nil)
+	req.Header.Set("Cookie", "_wrauth-gate="+gateCookieValue(staticGateAB()))
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("状态码 = %d，期望 302（免输直接回前缀）", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/warden/" {
+		t.Errorf("Location = %q，期望 /warden/", loc)
+	}
+	if *hits != 0 {
+		t.Errorf("上游被命中 %d 次，免输跳转不应转发", *hits)
+	}
+}
+
+// G7b 伪造 cookie 不足以免输 → 仍显示输入页
+func TestStaticGate_ForgedCookieStillPrompts(t *testing.T) {
+	srv, _, _ := gateChain(t, staticGateAB(), okJSON)
+
+	req, _ := http.NewRequest("GET", srv.URL+"/warden/.gate", nil)
+	req.Header.Set("Cookie", "_wrauth-gate=forged-value")
+	resp, err := noRedirectClient().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 = %d，期望 200（输入页）", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `name="k"`) {
+		t.Errorf("伪造 cookie 应看到输入页，得到：%s", body)
+	}
+}
+
+// G8 POST 表单提交（密钥不进 URL/浏览器历史/访问日志/Referer）：
+// 正确密钥 → 303 See Other（POST→GET 语义）+ 种 cookie
+func TestStaticGate_PostSubmitSetsCookie(t *testing.T) {
+	srv, _, hits := gateChain(t, staticGateAB(), okJSON)
+
+	resp, err := noRedirectClient().PostForm(srv.URL+"/warden/.gate",
+		url.Values{"k": {"0123456789abcdef"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("状态码 = %d，期望 303", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/warden/" {
+		t.Errorf("Location = %q，期望 /warden/", loc)
+	}
+	cookies := resp.Header["Set-Cookie"]
+	if len(cookies) != 1 || !strings.Contains(cookies[0], "_wrauth-gate="+gateCookieValue(staticGateAB())) {
+		t.Errorf("应种门控 cookie，得到 %v", cookies)
+	}
+	if *hits != 0 {
+		t.Errorf("上游被命中 %d 次，门控不应转发", *hits)
+	}
+}
+
+// G8b POST 错密钥 → 403 + 重试输入框
+func TestStaticGate_PostWrongKeyForbidden(t *testing.T) {
+	srv, _, hits := gateChain(t, staticGateAB(), okJSON)
+
+	resp, err := noRedirectClient().PostForm(srv.URL+"/warden/.gate",
+		url.Values{"k": {"wrongkey-wrongkey"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("状态码 = %d，期望 403", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `name="k"`) {
+		t.Errorf("403 错误页应含重试输入框，得到：%s", body)
+	}
+	if *hits != 0 {
+		t.Errorf("上游被命中 %d 次，403 不应转发", *hits)
+	}
+}
+
+// G9 门控输入页用 POST 提交（密钥不进 URL）
+func TestStaticGate_PromptUsesPostForm(t *testing.T) {
+	srv, _, _ := gateChain(t, staticGateAB(), okJSON)
+
+	resp, err := noRedirectClient().Get(srv.URL + "/warden/.gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `method="post"`) {
+		t.Errorf("输入页应用 POST 提交（避免密钥进 URL），得到：%s", body)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 消费型路由（token+key 无 gate）：只验 cookie 注入、不提供门控入口。
+// 场景：warden UI 的 API 路由（/api/v1/）——换 cookie 的入口在 /warden/
+// 一条即可，API 路由无需（也不该）再暴露一个门控路径（否则 302 落到
+// API 根，体验错误）。
+// ---------------------------------------------------------------------------
+
+func TestStaticInject_ConsumerRouteWithoutGate(t *testing.T) {
+	var seenAuth string
+	up := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		okJSON(w, r)
+	})
+	upHost, upPort, _ := authBridgeUpstream(t, up)
+
+	issuer := staticGateAB() // /warden/：完整三件套（发 cookie）
+	consumer := &AuthBridge{ // /api/v1/：仅消费（token+key，无 gate）
+		Token: "warden-static-token", Scheme: "Bearer", GateKey: "0123456789abcdef",
+	}
+	if !validRoute(&Route{Prefix: "/api/v1/", Host: "127.0.0.1", Port: 8789, Mode: ModeKeep, AuthBridge: consumer}) {
+		t.Fatal("消费型路由（token+key 无 gate）应通过校验")
+	}
+
+	tb := NewRouteTable()
+	tb.SetStatic([]*Route{
+		{Prefix: "/warden/", Host: upHost, Port: upPort, Mode: ModeKeep, Name: "warden", AuthBridge: issuer},
+		{Prefix: "/api/v1/", Host: upHost, Port: upPort, Mode: ModeKeep, Name: "warden", AuthBridge: consumer},
+	})
+	t.Cleanup(swapTable(tb))
+
+	srv := httptest.NewServer(recoverMiddleware(loggingMiddleware(http.HandlerFunc(handleAll))))
+	t.Cleanup(srv.Close)
+
+	// 消费型路由不再提供门控入口：请求其 gate 风格路径不会被拦截
+	// （GatePath 为空 → 不匹配任何路径，正常转发）
+	respGate, err := noRedirectClient().Get(srv.URL + "/api/v1/.gate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	respGate.Body.Close()
+	if respGate.StatusCode == http.StatusForbidden || respGate.StatusCode == http.StatusSeeOther {
+		t.Errorf("消费型路由不应有门控入口，得到 %d", respGate.StatusCode)
+	}
+
+	// 用 /warden/ 门控种下的 cookie（同 key 同默认名 → 同 HMAC 值），
+	// 请求 /api/v1/ → 注入生效
+	req, _ := http.NewRequest("GET", srv.URL+"/api/v1/services", nil)
+	req.Header.Set("Authorization", platformJWT)
+	req.Header.Set("Cookie", "_wrauth-gate="+gateCookieValue(issuer))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if got := seenAuth; got != "Bearer warden-static-token" {
+		t.Errorf("消费型路由收到 Authorization = %q，期望注入", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // gateCookieValue 纯函数
 // ---------------------------------------------------------------------------
@@ -427,9 +594,10 @@ func TestValidAuthBridge_StaticTrio(t *testing.T) {
 		{"nil", nil, true},
 		{"只有 token", &AuthBridge{Token: "tok"}, false},
 		{"只有 gate", &AuthBridge{GatePath: "/warden/.gate"}, false},
-		{"只有 gate_key", &AuthBridge{GateKey: "0123456789abcdef"}, false},
-		{"缺 gate_key", &AuthBridge{Token: "tok", GatePath: "/warden/.gate"}, false},
-		{"缺 gate", &AuthBridge{Token: "tok", GateKey: "0123456789abcdef"}, false},
+		{"只有 gate_key（无 token 可注入）", &AuthBridge{GateKey: "0123456789abcdef"}, false},
+		{"gate+key 无 token", &AuthBridge{GatePath: "/warden/.gate", GateKey: "0123456789abcdef"}, false},
+		{"缺 gate_key（token 无 key = 有伪造风险）", &AuthBridge{Token: "tok", GatePath: "/warden/.gate"}, false},
+		{"缺 gate（消费型，合法）", &AuthBridge{Token: "tok", GateKey: "0123456789abcdef"}, true},
 		{"缺 token", &AuthBridge{GatePath: "/warden/.gate", GateKey: "0123456789abcdef"}, false},
 		{"gate 不在前缀内", &AuthBridge{Token: "tok", GatePath: "/other/.gate", GateKey: "0123456789abcdef"}, false},
 		{"gate 等于前缀", &AuthBridge{Token: "tok", GatePath: "/warden/", GateKey: "0123456789abcdef"}, false},
